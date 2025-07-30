@@ -2,20 +2,17 @@ __pycache__/
 *.py[cod]
 .idea/
 
-# ignore large/generated datasets
-data/
+/data/
 
-# ignore model outputs
+
 model/
 
-# ignore logs
 logs/
 
-# byte‑compiled/PyCharm files
+
 __pycache__/
 *.py[cod]
 .idea/
 
-# any saved HDF5 or .pth files
 *.h5
 *.pth
