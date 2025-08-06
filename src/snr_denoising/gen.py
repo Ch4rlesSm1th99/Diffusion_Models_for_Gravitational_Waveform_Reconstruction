@@ -354,7 +354,7 @@ if __name__ == "__main__":
             f.create_dataset('spin2z', data=meta_s2)
             f.attrs['mode'] = 'random'
             f.attrs['max_length'] = max_len
-        print(f"Saved random dataset ({args.num_samples} samples, padded to {max_len}) → {args.output_path}")
+        print(f"Saved random dataset ({args.num_samples} samples, padded to {max_len}) at {args.output_path}")
 
         for idx in range(min(3, args.num_samples)):
             # retrieve the padded arrays
