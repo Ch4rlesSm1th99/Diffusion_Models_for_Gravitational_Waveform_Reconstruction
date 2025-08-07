@@ -279,6 +279,8 @@ if __name__ == "__main__":
 
         i = 0
         while i < args.num_samples:
+            if (i + 1) % 100 == 0 or (i + 1) == args.num_samples:
+                print(f"{i + 1}/{args.num_samples} generated")
             # sample masses so that m1 >= m2
             m1_val = np.random.uniform(args.mass1_min, args.mass1_max)
             m2_val = np.random.uniform(args.mass2_min, m1_val)
@@ -300,7 +302,7 @@ if __name__ == "__main__":
                     plot=False
                 )
             except RuntimeError as e:
-                print(f"[FAILURE] draw {i} failed (m1={m1_val:.1f}, m2={m2_val:.1f}, snr={snr_val:.1f}): {e}")
+                print(f"attempt {i} failed (m1={m1_val:.1f}, m2={m2_val:.1f}, snr={snr_val:.1f}): {e}")
                 continue  # do NOT increment i, retry
 
             sig_list.append(res['signal'].numpy())
