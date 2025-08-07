@@ -180,14 +180,12 @@ def generate_dataset(
         noises[i] = res['noise'].numpy()
         noisy[i]  = res['noisy_signal'].numpy()
 
-    # Save to HDF5
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('times',  data=times)
         f.create_dataset('signal', data=signals)
         f.create_dataset('noise',  data=noises)
         f.create_dataset('noisy',  data=noisy)
-        # Store parameters
         params = dict(
             mass1=mass1, mass2=mass2, target_snr=target_snr,
             spin1z=spin1z, spin2z=spin2z, distance=distance,
@@ -199,7 +197,6 @@ def generate_dataset(
 
     print(f"Saved {num_samples} samples at {output_path}")
 
-    # Plot three example files
     for idx in range(min(3, num_samples)):
         signal_array = signals[idx]
         noise_array  = noises[idx]
