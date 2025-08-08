@@ -2,104 +2,179 @@ import argparse
 import os
 import h5py
 import torch
-import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from snr_denoising.models.model import UNet1D, CustomDiffusion
+from tqdm import tqdm
+from models import UNet1D, CustomDiffusion
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a 1D diffusion model on LIGO waveforms")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="Path to HDF5 dataset (with /waveform)")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16,
-                        help="Batch size for DataLoader")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate")
-    parser.add_argument("--T", type=int, default=1000,
-                        help="Number of diffusion timesteps")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device (cpu or cuda)")
-    parser.add_argument("--save-dir", type=str, default="checkpoints",
-                        help="Directory to save model checkpoints")
-    return parser.parse_args()
+def prepare_output_dir(base_dir: str) -> str:
+    out_dir = os.path.join(base_dir, 'latest_model')
+    if os.path.exists(out_dir):
+        for file in os.listdir(out_dir):
+            os.remove(os.path.join(out_dir, file))
+    else:
+        os.makedirs(out_dir, exist_ok=True)
+    return out_dir
 
 
-class WaveDataset(Dataset):
-    """
-    PyTorch Dataset for loading clean waveforms from an HDF5 file.
-    Expects dataset['waveform'] shaped (N, L).
-    """
-    def __init__(self, h5_path):
+class CleanWaveDataset(Dataset):
+    def __init__(self, h5_path: str):
         self.h5 = h5py.File(h5_path, 'r')
-        self.data = self.h5['signal'][:]
+        self.signals = self.h5['signal']
 
     def __len__(self):
-        return self.data.shape[0]
+        return self.signals.shape[0]
 
     def __getitem__(self, idx):
-        # return shape (1, L)
-        x = self.data[idx]
-        return torch.from_numpy(x).unsqueeze(0).float()
+        clean_np = self.signals[idx]
+        clean = torch.from_numpy(clean_np).unsqueeze(0).float()
+        sigma = clean.std()
+        if sigma == 0:      # normalise + avoid divide by zero error (dont add small numebr)
+            sigma = torch.tensor(1.0)
+        clean_norm = clean / sigma
+        return clean_norm, sigma
+
+    def __del__(self):
+        try:
+            self.h5.close()
+        except Exception:
+            pass
+
+class NoisyWaveDataset(Dataset):
+    def __init__(self, h5_path: str):
+        self.h5 = h5py.File(h5_path,'r')
+        self.noisy = self.h5['noisy']
+
+    def __len__(self):
+        return self.noisy.shape[0]
+
+    def __getitem__(self, idx):
+        noisy_np = self.noisy[idx]
+        noisy = torch.from_numpy(noisy_np).unsqueeze(0).float()
+        sigma = noisy.std()
+        if sigma == 0:
+            sigma = torch.tensor(1.0)
+        noisy_norm = noisy/sigma
+        return noisy_norm, sigma
+
+    def __del__(self):
+        try:
+            self.h5.close()
+        except Exception:
+            pass
 
 
-def train(args):
-    os.makedirs(args.save_dir, exist_ok=True)
+def train_diffusion(args):
+    out_dir = prepare_output_dir(args.model_dir)
 
-    # dataset & loader
-    dataset = WaveDataset(args.dataset)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    ds = NoisyWaveDataset(args.data)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
 
-    # model & diffusion
-    model = UNet1D(in_ch=1, base_ch=64, time_dim=128, depth=3).to(args.device)
-    diffusion = CustomDiffusion(T=args.T, device=args.device)
-
-    # optimizer & loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.MSELoss()
+    device = torch.device(args.device)
+    model = UNet1D(in_ch=1, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
+    diffusion = CustomDiffusion(T=args.T, device=device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    criterion = torch.nn.MSELoss()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
+        for i, (noisy_norm, sigma) in enumerate(pbar):
+            noisy_norm = noisy_norm.to(device)
+            sigma = sigma.to(device)
+            bsz = noisy_norm.size(0)
 
-        for x0 in loader:
-            x0 = x0.to(args.device)  # shape (B,1,L)
+            t = torch.randint(0, args.T, (bsz,), device=device)     # sample timesteps
 
-            # sample random timesteps for each sample
-            bsz = x0.size(0)
-            t = torch.randint(0, diffusion.T, (bsz,), device=args.device)
+            xt, noise = diffusion.q_sample(noisy_norm, t)       # forward diffusion
 
-            # forward diffusion: get noisy x_t and the true noise
-            xt, noise = diffusion.q_sample(x0, t)
+            pred_noise = model(xt, t)
 
-            # predict noise
-            pred = model(xt, t)
+            # training diagnostics
+            if i == 0:
+                def _stats(x):
+                    return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
 
-            # compute loss
-            loss = loss_fn(pred, noise)
+                nn_min, nn_max, nn_mean, nn_std = _stats(noisy_norm)           # input singal to forward diffusion stat
+                noise_min, noise_max, noise_mean, noise_std = _stats(noise)         # ground truth epsilon stat
+                xt_min, xt_max, xt_mean, xt_std = _stats(xt)       # noised signal at timestep t after forward process stat
+                p_min, p_max, p_mean, p_std = _stats(pred_noise)           # pred of epsilon stat
 
+                recon_norm = xt - pred_noise        # reconstruct normalised signal
+                r_min, r_max, r_mean, r_std = _stats(recon_norm)    # trend check
+
+                recon_unnorm = recon_norm * sigma.view(-1, 1, 1)        # un-normalize
+                ru_min, ru_max, ru_mean, ru_std = _stats(recon_unnorm)
+
+                print(f"[DEBUG] noisy_norm:  min={nn_min:.3e}, max={nn_max:.3e}, mean={nn_mean:.3e}, std={nn_std:.3e}")
+                print(
+                    f"[DEBUG] noise:        min={noise_min:.3e}, max={noise_max:.3e}, mean={noise_mean:.3e}, std={noise_std:.3e}")
+                print(f"[DEBUG] xt:           min={xt_min:.3e}, max={xt_max:.3e}, mean={xt_mean:.3e}, std={xt_std:.3e}")
+                print(f"[DEBUG] pred_noise:   min={p_min:.3e}, max={p_max:.3e}, mean={p_mean:.3e}, std={p_std:.3e}")
+                print(f"[DEBUG] recon_norm:   min={r_min:.3e}, max={r_max:.3e}, mean={r_mean:.3e}, std={r_std:.3e}")
+                print(
+                    f"[DEBUG] recon_unnorm: min={ru_min:.3e}, max={ru_max:.3e}, mean={ru_mean:.3e}, std={ru_std:.3e}\n")
+
+
+                recon_mse_norm = torch.nn.functional.mse_loss(recon_norm, noisy_norm)
+                print(f"[CHECK] Epoch {epoch} recon MSE (norm): {recon_mse_norm:.3e}")  # MSE on recon norm
+
+                noisy_flat = noisy_norm.view(bsz, -1)
+                recon_flat = recon_norm.view(bsz, -1)
+                cos_sim_norm = torch.nn.functional.cosine_similarity(noisy_flat, recon_flat, dim=1).mean()
+                print(f"[CHECK] Epoch {epoch} cos-sim (norm): {cos_sim_norm:.3f}")      # cosine simaliry on norm
+
+                true_noise_norm = xt - noisy_norm
+                res_noise_norm = true_noise_norm - pred_noise
+                snr_imp_norm = true_noise_norm.std() / res_noise_norm.std()
+                print(f"[CHECK] Epoch {epoch} SNR improvement (norm): {snr_imp_norm:.2f}x") # SNR improvement
+
+            loss = criterion(pred_noise, noise)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item() * bsz
+            pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-        avg_loss = total_loss / len(dataset)
-        print(f"Epoch {epoch:3d}/{args.epochs}, Loss: {avg_loss:.6f}")
+        avg_loss = total_loss / len(ds)
+        print(f"Epoch {epoch}/{args.epochs} - Average Loss: {avg_loss:.6f}")
 
-        # save checkpoint every 10 epochs
-        if epoch % 10 == 0 or epoch == args.epochs:
-            ckpt_path = os.path.join(args.save_dir, f"unet_epoch{epoch}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'loss': avg_loss
-            }, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+    save_path = os.path.join(out_dir, 'model_diffusion.pth')
+    torch.save({
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'args': vars(args),
+        'epoch': args.epochs,
+    }, save_path)
+    print(f"Saved model to {save_path}")
 
 
-if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train diffusion model on LIGO waveforms")
+    parser.add_argument('--data',       type=str, required=True,
+                        help='Path to HDF5 file with "signal" dataset')
+    parser.add_argument('--model_dir',  type=str, default='model',
+                        help='Base directory to create latest_model')
+    parser.add_argument('--epochs',     type=int,   default=50,
+                        help='Number of epochs')
+    parser.add_argument('--batch-size', type=int,   default=16,
+                        help='Batch size')
+    parser.add_argument('--lr',         type=float, default=1e-4,
+                        help='Learning rate')
+    parser.add_argument('--T',          type=int,   default=1000,
+                        help='Number of diffusion timesteps')
+    parser.add_argument('--base_ch',    type=int,   default=64,
+                        help='Base channel count for UNet')
+    parser.add_argument('--time_dim',   type=int,   default=128,
+                        help='Time embedding dimension')
+    parser.add_argument('--depth',      type=int,   default=3,
+                        help='UNet depth (number of down/up blocks)')
+    parser.add_argument('--device',     type=str,   default=None,
+                        help='Device (cpu or cuda)')
+    args = parser.parse_args()
+    args.device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    train_diffusion(args)
