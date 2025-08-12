@@ -9,6 +9,17 @@ from pycbc.filter import sigma
 import os
 import h5py
 
+"""
+gen.py — Generate time-domain GW waveforms with LIGO-like noise, and write HDF5 datasets with seperate propoerties.
+
+Modes:
+  - fixed:  repeat one wave config for the entire dataset
+  - random: randomly sample wave configs within ranges
+  - grid:   balanced coverage of (m1, m2) pairs in a grid; NOTE: optional symmetric augmentation of labels
+Output:
+  HDF5 containing signal/noise/noisy, times or mask (depending on padding), metadata and gen mode.
+"""
+
 # PSD cache to append interpolated values. this will avoid calling the interpolator at every waveform computation.
 _PSD_CACHE = {}
 
@@ -52,7 +63,7 @@ def generate_ligo_waveform(
     waveform_epoch = signal._epoch
 
     # retrieve PSD
-    psd_key = f"{detector}_{sampling_rate}_{len(signal)}"
+    psd_key = f"{detector}_{sampling_rate}_{len(signal)}_{f_lower}"
     if psd_key in _PSD_CACHE:
         psd = _PSD_CACHE[psd_key]
     else:
@@ -78,7 +89,6 @@ def generate_ligo_waveform(
     noise_array = noise.numpy()
     noisy_array = noisy_signal.numpy()
 
-    # Optional plotting
     if plot:
         plt.figure(figsize=(10, 6))
         plt.subplot(3, 1, 1)
@@ -114,24 +124,93 @@ def generate_ligo_waveform(
     }
 
 
-def collect_samples(sample_specs):
-    """Generate all samples from a list of specs (each spec is the kwargs for generate_ligo_waveform)."""
+def collect_samples(sample_specs, plot_flag=False):
+    """
+    Generate all samples from a list of specs (each spec is kwargs for generate_ligo_waveform),
+    generator enforces m1 >= m2 for use. NOTE for arg.augment_symmetric this simply relables
+    m1 + m2 combos to fill for paris where m1 < m2.
+
+    Every spec should contain at least:
+      - mass1, mass2, target_snr, spin1z, spin2z
+    (for arg.augment_symmetric labeling):
+      - label_m1, label_m2, label_s1, label_s2
+    """
     sig_list, noise_list, noisy_list, t_list = [], [], [], []
-    meta = {k: [] for k in ['mass1','mass2','snr','spin1z','spin2z']}
+
+    meta = {k: [] for k in [
+        'mass1','mass2','snr','spin1z','spin2z',          # intrinsic (sorted for generator)
+        'label_m1','label_m2','label_s1','label_s2',      # intended labeling (could be swapped for grid mode)
+        'q','chirp_mass'
+    ]}
+
     for i, spec in enumerate(sample_specs):
+        # target labels for metadata (fallback to given values)
+        Lm1 = spec.get('label_m1', spec['mass1'])
+        Lm2 = spec.get('label_m2', spec['mass2'])
+        Ls1 = spec.get('label_s1', spec['spin1z'])
+        Ls2 = spec.get('label_s2', spec['spin2z'])
+
+        # sort for the generator call (avoid m1 < m2 error), swap labels and spins
+        m1, m2 = float(spec['mass1']), float(spec['mass2'])
+        s1, s2 = float(spec['spin1z']), float(spec['spin2z'])
+        if m1 < m2:
+            m1, m2, s1, s2 = m2, m1, s2, s1
+
+        # compile a CLEAN kwargs dict with allowed keys ONLY
+        call_kwargs = {
+            'mass1': m1,
+            'mass2': m2,
+            'target_snr': float(spec['target_snr']),
+            'spin1z': s1,
+            'spin2z': s2,
+            'distance': float(spec.get('distance', 410.0)),
+            'f_lower': float(spec.get('f_lower', 20.0)),
+            'sampling_rate': int(spec.get('sampling_rate', 4096)),
+            'detector': spec.get('detector', 'H1'),
+            'ra': float(spec.get('ra', 0.0)),
+            'dec': float(spec.get('dec', 0.0)),
+            'polarization': float(spec.get('polarization', 0.0)),
+        }
+
         try:
-            plot_this = args.plot and i < 3
-            res = generate_ligo_waveform(**spec, random_seed=i, plot=plot_this)
+            plot_this = plot_flag and i < 3
+            res = generate_ligo_waveform(**call_kwargs, random_seed=i, plot=plot_this)
         except Exception as e:
-            print(f"generation failed for {spec}: {e}")
+            print(f"generation failed for labeled {spec}: {e}")
             continue
+
         sig_list.append(res['signal'].numpy())
         noise_list.append(res['noise'].numpy())
         noisy_list.append(res['noisy_signal'].numpy())
         t_list.append(res['times'])
-        for k in meta.keys():
-            if k in spec: meta[k].append(spec[k])
+
+        # save epoch per sample (absolute start time)
+        if 'epoch' not in meta:
+            meta['epoch'] = []
+        meta['epoch'].append(float(res['epoch']))
+
+        # intrinsic (sorted) params actually used
+        meta['mass1'].append(m1)
+        meta['mass2'].append(m2)
+        meta['spin1z'].append(s1)
+        meta['spin2z'].append(s2)
+        meta['snr'].append(float(spec['target_snr']))
+
+        # intended labels (may be swapped for symmetric aug arg)
+        meta['label_m1'].append(float(Lm1))
+        meta['label_m2'].append(float(Lm2))
+        meta['label_s1'].append(float(Ls1))
+        meta['label_s2'].append(float(Ls2))
+
+        q = m1 / m2
+        M = m1 + m2
+        eta = (m1 * m2) / (M * M)
+        Mchirp = (eta ** (3.0/5.0)) * M
+        meta['q'].append(q)
+        meta['chirp_mass'].append(Mchirp)
+
     return sig_list, noise_list, noisy_list, t_list, meta
+
 
 
 def finalize_and_write(
@@ -142,7 +221,7 @@ def finalize_and_write(
     physical_len=None,
     attrs_extra=None
 ):
-    """Apply padding strategy once and write a HDF5 with consistent layout for the modes."""
+    """apply a padding strategy and write a HDF5 with consistent layout for the modes."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     lengths = np.array([len(x) for x in sig_list], dtype=np.int32)
 
@@ -173,7 +252,7 @@ def finalize_and_write(
         target_len = int(physical_len)
         pad_attr_name, pad_attr_val = 'physical_length', target_len
     else:
-        raise ValueError(f"Unknown padding_mode: {padding_mode}")
+        raise ValueError(f"unrecognised padding_mode: {padding_mode}")
 
     delta_t = 1.0 / float(sampling_rate)
     times = np.arange(target_len) * delta_t
@@ -193,10 +272,14 @@ def finalize_and_write(
 
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('times',   data=times)
-        f.create_dataset('signal',  data=signals)
-        f.create_dataset('noise',   data=noises)
-        f.create_dataset('noisy',   data=noisy)
-        f.create_dataset('mask',    data=mask)
+        chunk_len = min(16384, target_len)  # tweak if needed
+        dset_kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=(1, chunk_len))
+
+        f.create_dataset('signal', data=signals, **dset_kwargs)
+        f.create_dataset('noise', data=noises, **dset_kwargs)
+        f.create_dataset('noisy', data=noisy, **dset_kwargs)
+        f.create_dataset('mask', data=mask, **dset_kwargs)
+
         f.create_dataset('lengths', data=lengths)
         f.attrs['padding'] = padding_mode
         f.attrs['sampling_rate'] = float(sampling_rate)
@@ -205,45 +288,111 @@ def finalize_and_write(
             for k,v in attrs_extra.items(): f.attrs[k] = v
         for k, arr in meta.items():
             if arr: f.create_dataset(k, data=np.array(arr, dtype=np.float32))
-    print(f"Saved {N} samples (padding={padding_mode}, {pad_attr_name}={pad_attr_val}) → {output_path}")
+    print(f"saved {N} samples (padding={padding_mode}, {pad_attr_name}={pad_attr_val}) --> {output_path}")
 
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate LIGO waveform datasets")
-    parser.add_argument('--mode', choices=['fixed', 'random', 'grid'], default='fixed')
-    parser.add_argument('--num-samples', type=int, required=True)
-    parser.add_argument('--output-path', type=str, required=True)
-    # Fixed mode params
-    parser.add_argument('--mass1', type=float, default=20.0)
-    parser.add_argument('--mass2', type=float, default=20.0)
-    parser.add_argument('--snr', type=float, default=8000.0)
-    # Random mode ranges
-    parser.add_argument('--mass1-min', type=float, default=20.0)
-    parser.add_argument('--mass1-max', type=float, default=20.0)
-    parser.add_argument('--mass2-min', type=float, default=20.0)
-    parser.add_argument('--mass2-max', type=float, default=20.0)
-    parser.add_argument('--snr-min', type=float, default=8000.0)
-    parser.add_argument('--snr-max', type=float, default=8000.0)
-    parser.add_argument('--spin1-min', type=float, default=0.0)
-    parser.add_argument('--spin1-max', type=float, default=0.0)
-    parser.add_argument('--spin2-min', type=float, default=0.0)
-    parser.add_argument('--spin2-max', type=float, default=0.0)
-    # Padding options
-    parser.add_argument('--padding', choices=['dataset_max', 'none', 'physical_max'],
-                        default='dataset_max',
-                        help='How to pad variable-length waveforms.')
-    parser.add_argument('--phys-m1', type=float, default=10.0)
-    parser.add_argument('--phys-m2', type=float, default=10.0)
-    parser.add_argument('--phys-s1', type=float, default=0.0)
-    parser.add_argument('--phys-s2', type=float, default=0.0)
-    # Plotting
-    parser.add_argument('--plot', action='store_true')
+
+    class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+        pass
+
+
+    parser = argparse.ArgumentParser(
+        prog="gen.py",
+        description=(
+            "Generate LIGO-like time-domain GW waveforms and write an HDF5 dataset.\n\n"
+            "MODES\n"
+            "  fixed  : repeat a single (m1, m2, snr, spins) config N times\n"
+            "  random : sample (m1, m2, snr, spins) uniformly within ranges\n"
+            "  grid   : make an even grid over (m1, m2); balanced #samples per unordered pair (m2 <= m1)\n"
+            "           NOTE: with --augment-symmetric we also write the swapped labels in metadata so you\n"
+            "                 can train models that care about labeling, while generation stays safe (m1>=m2).\n\n"
+            "OUTPUT\n"
+            "  HDF5 containing:\n"
+            "    - signal/noise/noisy arrays\n"
+            "    - times (variable-length mode) OR (times, mask) in padded modes\n"
+            "    - metadata per sample (masses, spins, SNR, epoch, symmetric helpers like q, chirp_mass)\n\n"
+            "EXAMPLES\n"
+            "  fixed : python gen.py --mode fixed  --num-samples 10 --mass1 30 --mass2 20 --snr 15 --output-path out.h5\n"
+            "  random: python gen.py --mode random --num-samples 100 --mass1-min 10 --mass1-max 50 --snr-min 10 --snr-max 30 --output-path out.h5\n"
+            "  grid  : python gen.py --mode grid   --num-samples 5000 --mass1-min 10 --mass1-max 90 --mass2-min 10 --mass2-max 90 "
+            "--grid-steps 9 --augment-symmetric --snr-min 10 --snr-max 100 --output-path out.h5\n"
+        ),
+        formatter_class=_HelpFmt,
+    )
+
+    # GENERAL
+    g_general = parser.add_argument_group("General")
+    g_general.add_argument('--mode', choices=['fixed', 'random', 'grid'], default='fixed',
+                           help='Which generator to use.')
+    g_general.add_argument('--num-samples', type=int, required=True,
+                           help='How many samples to write.')
+    g_general.add_argument('--output-path', type=str, required=True,
+                           help='Destination HDF5 path (parent folders will be created).')
+    g_general.add_argument('--seed', type=int, default=123,
+                           help='Random seed for reproducibility across all modes.')
+
+    # FIXED MODE
+    g_fixed = parser.add_argument_group("Fixed mode (used only when --mode fixed)")
+    g_fixed.add_argument('--mass1', type=float, default=20.0, help='Primary mass (Msun).')
+    g_fixed.add_argument('--mass2', type=float, default=20.0, help='Secondary mass (Msun).')
+    g_fixed.add_argument('--snr', type=float, default=8000.0, help='Target SNR for the repeated config.')
+
+    # RANDOM MODE AND GRID MODE
+    g_ranges = parser.add_argument_group("Parameter ranges (used by --mode random / --mode grid)")
+    g_ranges.add_argument('--mass1-min', type=float, default=20.0, help='Min primary mass (Msun).')
+    g_ranges.add_argument('--mass1-max', type=float, default=20.0, help='Max primary mass (Msun).')
+    g_ranges.add_argument('--mass2-min', type=float, default=20.0, help='Min secondary mass (Msun).')
+    g_ranges.add_argument('--mass2-max', type=float, default=20.0, help='Max secondary mass (Msun).')
+    g_ranges.add_argument('--snr-min', type=float, default=8000.0, help='Min SNR draw.')
+    g_ranges.add_argument('--snr-max', type=float, default=8000.0, help='Max SNR draw.')
+    g_ranges.add_argument('--spin1-min', type=float, default=0.0, help='Min aligned spin of body 1.')
+    g_ranges.add_argument('--spin1-max', type=float, default=0.0, help='Max aligned spin of body 1.')
+    g_ranges.add_argument('--spin2-min', type=float, default=0.0, help='Min aligned spin of body 2.')
+    g_ranges.add_argument('--spin2-max', type=float, default=0.0, help='Max aligned spin of body 2.')
+
+    # EXTRA GRID MODE OPTS
+    g_grid = parser.add_argument_group("Grid mode (used only when --mode grid)")
+    g_grid.add_argument('--grid-steps', type=int, default=5,
+                        help='Number of evenly spaced points between min/max for mass1 and mass2 (e.g. 9 gives 10,20,...,90).')
+    g_grid.add_argument('--augment-symmetric', action='store_true',
+                        help='Also include swapped labels in metadata (label_m1,label_m2) for each unordered combo. '
+                             'Generation still calls the waveform with sorted masses (m1>=m2).')
+    g_grid.add_argument('--shuffle', action='store_true',
+                        help='Shuffle the order of samples before writing (helps avoid contiguous blocks per combo).')
+    g_grid.add_argument('--overgen-factor', type=float, default=1.05,
+                        help='Over-generate by this fraction then trim back to exactly --num-samples. '
+                             'Useful because a few combos/noise draws can be rejected by the simulator.')
+
+    # PADDING OPTIONS
+    g_pad = parser.add_argument_group("Padding")
+    g_pad.add_argument('--padding', choices=['dataset_max', 'none', 'physical_max'], default='dataset_max',
+                       help=("Padding strategy:\n"
+                             "  none         : variable-length datasets (vlen) per sample\n"
+                             "  dataset_max  : pad/truncate all to the max length observed in this run\n"
+                             "  physical_max : pad/truncate all to the length of a reference physical system "
+                             "(see --phys-* parameters)"))
+    g_pad.add_argument('--phys-m1', type=float, default=10.0, help='Reference mass1 for physical_max padding.')
+    g_pad.add_argument('--phys-m2', type=float, default=10.0, help='Reference mass2 for physical_max padding.')
+    g_pad.add_argument('--phys-s1', type=float, default=0.0, help='Reference spin1z for physical_max padding.')
+    g_pad.add_argument('--phys-s2', type=float, default=0.0, help='Reference spin2z for physical_max padding.')
+
+    # MISC
+    g_misc = parser.add_argument_group("Misc")
+    g_misc.add_argument('--plot', action='store_true',
+                        help='Plot the first few generated examples for a quick visual check.')
 
     args = parser.parse_args()
 
+    import json
+
+    args_json = json.dumps(vars(args), sort_keys=True)
+    if args.mass2_min > args.mass1_max:
+        raise ValueError("mass2_min must be <= mass1_max; otherwise no (m2 <= m1) pairs exist for the grid.")
+    np.random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
 
     if args.mode == 'fixed':
@@ -256,7 +405,7 @@ if __name__ == "__main__":
             )
             for _ in range(args.num_samples)
         ]
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)
 
         phys_len = None
         if args.padding == 'physical_max':
@@ -272,7 +421,7 @@ if __name__ == "__main__":
             padding_mode=args.padding,
             sampling_rate=4096,
             physical_len=phys_len,
-            attrs_extra={'mode': 'fixed'}
+            attrs_extra={'mode': 'fixed', 'config_args': args_json}
         )
 
 
@@ -313,7 +462,7 @@ if __name__ == "__main__":
 
                                f"(attempted {attempts}). please narrow ranges.")
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)
 
         phys_len = None
         if args.padding == 'physical_max':
@@ -330,10 +479,161 @@ if __name__ == "__main__":
             padding_mode=args.padding,
             sampling_rate=4096,
             physical_len=phys_len,
-            attrs_extra={'mode': 'random'}
+            attrs_extra={'mode': 'random', 'config_args': args_json}
         )
 
-
     elif args.mode == 'grid':
-        pass
+
+        import itertools
+
+        rng = np.random.default_rng(args.seed)
+        n = max(2, int(args.grid_steps))        # build the grid for masses
+        m1_vals = np.linspace(args.mass1_min, args.mass1_max, n)
+        m2_vals = np.linspace(args.mass2_min, args.mass2_max, n)
+
+        # keep only unordered pairs (m2 <= m1) to avoid duplicates and generator breaks
+        combos = [(float(m1), float(m2))
+                  for m1, m2 in itertools.product(m1_vals, m2_vals)
+                  if m2 <= m1]
+        valid_combos = []
+        for (m1, m2) in combos:
+            try:
+                _ = generate_ligo_waveform(
+                    mass1=max(m1, m2), mass2=min(m1, m2),
+                    target_snr=20.0,
+                    spin1z=0.0, spin2z=0.0,
+                    distance=410.0, f_lower=20.0,
+                    sampling_rate=4096, detector="H1",
+                    ra=0.0, dec=0.0, polarization=0.0,
+                    random_seed=0, plot=False
+                )
+                valid_combos.append((m1, m2))
+            except Exception as e:
+                print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}")
+
+        combos = valid_combos
+        C = len(combos)
+        if C == 0:
+            raise RuntimeError("no valid (m1,m2) combos after probe. CHANGE RANGES!.")
+
+        N_target = int(np.ceil(args.num_samples * args.overgen_factor))  # balanced counts across combos to hit exactly N samples
+        base = N_target // C
+        rem = N_target % C
+
+        def draw_spin(min_v, max_v):
+            return float(min_v) if min_v == max_v else float(rng.uniform(min_v, max_v))
+
+        sample_specs = []
+
+        for idx, (m1, m2) in enumerate(combos):
+            count = base + (1 if idx < rem else 0)
+            if count <= 0:
+                continue
+
+            # augment-symmetric labelling: split counts between (m1,m2) and the swapped labeling (m2,m1)
+            if args.augment_symmetric:
+                count_a = count // 2
+                count_b = count - count_a
+                # Option A: intended labels (m1,m2) (not swapped)
+                for _ in range(count_a):
+                    s1 = draw_spin(args.spin1_min, args.spin1_max)
+                    s2 = draw_spin(args.spin2_min, args.spin2_max)
+                    snr_val = float(rng.uniform(args.snr_min, args.snr_max))
+                    spec = dict(
+                        mass1=m1, mass2=m2,
+                        spin1z=s1, spin2z=s2,
+                        target_snr=snr_val,
+                        distance=410.0, f_lower=20.0,
+                        sampling_rate=4096, detector="H1",
+                        ra=0.0, dec=0.0, polarization=0.0,
+                        label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
+                    )
+
+                    sample_specs.append(spec)
+
+                # Option B: intended labels swapped (m2,m1)
+                for _ in range(count_b):
+                    s1 = draw_spin(args.spin1_min, args.spin1_max)
+                    s2 = draw_spin(args.spin2_min, args.spin2_max)
+                    snr_val = float(rng.uniform(args.snr_min, args.snr_max))
+                    spec = dict(
+                        mass1=m2, mass2=m1,  # swapped intended labels
+                        spin1z=s2, spin2z=s1,  # spins swapped with labels
+                        target_snr=snr_val,
+                        distance=410.0, f_lower=20.0,
+                        sampling_rate=4096, detector="H1",
+                        ra=0.0, dec=0.0, polarization=0.0,
+                        label_m1=m2, label_m2=m1, label_s1=s2, label_s2=s1
+                    )
+
+                    sample_specs.append(spec)
+
+            else:
+                # Option A (unordered only): all intended labels are (m1,m2)
+
+                for _ in range(count):
+                    s1 = draw_spin(args.spin1_min, args.spin1_max)
+                    s2 = draw_spin(args.spin2_min, args.spin2_max)
+                    snr_val = float(rng.uniform(args.snr_min, args.snr_max))
+                    spec = dict(
+                        mass1=m1, mass2=m2,
+                        spin1z=s1, spin2z=s2,
+                        target_snr=snr_val,
+                        distance=410.0, f_lower=20.0,
+                        sampling_rate=4096, detector="H1",
+                        ra=0.0, dec=0.0, polarization=0.0,
+                        label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
+                    )
+
+                    sample_specs.append(spec)
+
+
+        if args.shuffle:        # optional shuffle for HDF5 ordering
+            rng.shuffle(sample_specs)
+
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)     # gen
+
+        succ = len(sig_list)
+        if succ >= args.num_samples:
+            keep = args.num_samples
+            sig_list = sig_list[:keep]
+            noise_list = noise_list[:keep]
+            noisy_list = noisy_list[:keep]
+            t_list = t_list[:keep]
+            for k in meta.keys():
+                meta[k] = meta[k][:keep]
+        else:
+            print(f"[WARNING!] only generated {succ}/{args.num_samples} after filtering failures. "
+                  f"try increasing --overgen-factor or re-running.")
+
+        phys_len = None
+
+        if args.padding == 'physical_max':
+            phys_len = len(generate_ligo_waveform(
+                mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
+                spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
+                f_lower=20.0, sampling_rate=4096, detector="H1",
+                ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
+            )['signal'])
+
+        finalize_and_write(
+            output_path=args.output_path,
+            sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
+            padding_mode=args.padding,
+            sampling_rate=4096,
+            physical_len=phys_len,
+            attrs_extra={
+                'mode': 'grid',
+                'grid_steps': int(n),
+                'num_combos': int(C),
+                'snr_min': float(args.snr_min),
+                'snr_max': float(args.snr_max),
+                'augment_symmetric': bool(args.augment_symmetric),
+                'shuffle': bool(args.shuffle),
+                'seed': int(args.seed),
+                'overgen_factor': float(args.overgen_factor),
+                'config_args': args_json
+            }
+        )
+
 
