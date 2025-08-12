@@ -23,6 +23,8 @@ Output:
 # PSD cache to append interpolated values. this will avoid calling the interpolator at every waveform computation.
 _PSD_CACHE = {}
 
+
+
 def generate_ligo_waveform(
     mass1,
     mass2,
@@ -124,7 +126,7 @@ def generate_ligo_waveform(
     }
 
 
-def collect_samples(sample_specs, plot_flag=False):
+def collect_samples(sample_specs, plot_flag=False, progress_every=0):
     """
     Generate all samples from a list of specs (each spec is kwargs for generate_ligo_waveform),
     generator enforces m1 >= m2 for use. NOTE for arg.augment_symmetric this simply relables
@@ -183,6 +185,9 @@ def collect_samples(sample_specs, plot_flag=False):
         noise_list.append(res['noise'].numpy())
         noisy_list.append(res['noisy_signal'].numpy())
         t_list.append(res['times'])
+
+        if progress_every and ((i + 1) % progress_every == 0 or (i + 1) == len(sample_specs)):
+            print(f"generated {i + 1}/{len(sample_specs)}")
 
         # save epoch per sample (absolute start time)
         if 'epoch' not in meta:
@@ -384,6 +389,8 @@ if __name__ == "__main__":
     g_misc = parser.add_argument_group("Misc")
     g_misc.add_argument('--plot', action='store_true',
                         help='Plot the first few generated examples for a quick visual check.')
+    g_misc.add_argument('--progress-every', type=int, default=0,
+                        help='If > 0, print progress every N items during probe/build/generation.')
 
     args = parser.parse_args()
 
@@ -405,7 +412,7 @@ if __name__ == "__main__":
             )
             for _ in range(args.num_samples)
         ]
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
 
         phys_len = None
         if args.padding == 'physical_max':
@@ -462,7 +469,7 @@ if __name__ == "__main__":
 
                                f"(attempted {attempts}). please narrow ranges.")
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
 
         phys_len = None
         if args.padding == 'physical_max':
@@ -496,7 +503,8 @@ if __name__ == "__main__":
                   for m1, m2 in itertools.product(m1_vals, m2_vals)
                   if m2 <= m1]
         valid_combos = []
-        for (m1, m2) in combos:
+        total_probe = len(combos)
+        for pi, (m1, m2) in enumerate(combos):
             try:
                 _ = generate_ligo_waveform(
                     mass1=max(m1, m2), mass2=min(m1, m2),
@@ -509,7 +517,10 @@ if __name__ == "__main__":
                 )
                 valid_combos.append((m1, m2))
             except Exception as e:
-                print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}")
+                print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}", flush=True)
+
+            if args.progress_every and ((pi + 1) % args.progress_every == 0 or (pi + 1) == total_probe):
+                print(f"[grid] probe {pi + 1}/{total_probe} | valid={len(valid_combos)}", flush=True)
 
         combos = valid_combos
         C = len(combos)
@@ -523,7 +534,9 @@ if __name__ == "__main__":
         def draw_spin(min_v, max_v):
             return float(min_v) if min_v == max_v else float(rng.uniform(min_v, max_v))
 
+
         sample_specs = []
+        built = 0
 
         for idx, (m1, m2) in enumerate(combos):
             count = base + (1 if idx < rem else 0)
@@ -550,6 +563,9 @@ if __name__ == "__main__":
                     )
 
                     sample_specs.append(spec)
+                    built += 1
+                    if args.progress_every and (built % args.progress_every == 0):
+                        print(f"built specs {built}/{N_target}", flush=True)
 
                 # Option B: intended labels swapped (m2,m1)
                 for _ in range(count_b):
@@ -567,6 +583,9 @@ if __name__ == "__main__":
                     )
 
                     sample_specs.append(spec)
+                    built += 1
+                    if args.progress_every and (built % args.progress_every == 0):
+                        print(f"built specs {built}/{N_target}", flush=True)
 
             else:
                 # Option A (unordered only): all intended labels are (m1,m2)
@@ -586,12 +605,15 @@ if __name__ == "__main__":
                     )
 
                     sample_specs.append(spec)
+                    built += 1
+                    if args.progress_every and (built % args.progress_every == 0):
+                        print(f"built specs {built}/{N_target}", flush=True)
 
 
         if args.shuffle:        # optional shuffle for HDF5 ordering
             rng.shuffle(sample_specs)
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot)     # gen
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
 
         succ = len(sig_list)
         if succ >= args.num_samples:
