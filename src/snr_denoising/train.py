@@ -1,6 +1,7 @@
 import argparse
 import os
 import h5py
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -43,57 +44,77 @@ class CleanWaveDataset(Dataset):
 
 class NoisyWaveDataset(Dataset):
     def __init__(self, h5_path: str):
-        self.h5 = h5py.File(h5_path,'r')
-        self.noisy = self.h5['noisy']
+        self.h5_path = h5_path
+        self.h5 = None
+        self.noisy = None
+        self.mask = None
+
+    def _ensure_open(self):
+        if self.h5 is None:
+            self.h5 = h5py.File(self.h5_path, 'r', swmr=True)  # read-only
+            self.noisy = self.h5['noisy']
+            self.mask  = self.h5.get('mask', None)
 
     def __len__(self):
-        return self.noisy.shape[0]
+        if self.noisy is not None:
+            return self.noisy.shape[0]
+        with h5py.File(self.h5_path, 'r') as f:
+            return f['noisy'].shape[0]
 
     def __getitem__(self, idx):
-        noisy_np = self.noisy[idx]
-        noisy = torch.from_numpy(noisy_np).unsqueeze(0).float()
-        sigma = noisy.std()
-        if sigma == 0:
-            sigma = torch.tensor(1.0)
-        noisy_norm = noisy/sigma
-        return noisy_norm, sigma
+        self._ensure_open()
+        noisy = torch.from_numpy(self.noisy[idx]).unsqueeze(0).float()
+        if self.mask is not None:
+            mask = torch.from_numpy(self.mask[idx].astype(np.float32)).unsqueeze(0)
+            valid = noisy[mask.bool()]
+            sigma = valid.std() if valid.numel() > 0 else torch.tensor(1.0)
+        else:
+            mask = torch.ones_like(noisy)
+            s = noisy.std()
+            sigma = s if s > 0 else torch.tensor(1.0)
+        noisy_norm = noisy / sigma
+        return noisy_norm, sigma, mask
 
     def __del__(self):
         try:
-            self.h5.close()
-        except Exception:
+            if self.h5 is not None:
+                self.h5.close()
+        except:
             pass
+
+
 
 
 def train_diffusion(args):
     out_dir = prepare_output_dir(args.model_dir)
 
     ds = NoisyWaveDataset(args.data)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(ds,batch_size=args.batch_size,shuffle=True,num_workers=4, pin_memory=True,persistent_workers=True,prefetch_factor=2)
 
     device = torch.device(args.device)
     model = UNet1D(in_ch=1, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
     diffusion = CustomDiffusion(T=args.T, device=device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = torch.nn.MSELoss()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for i, (noisy_norm, sigma) in enumerate(pbar):
+        for i, (noisy_norm, sigma, mask) in enumerate(pbar):
             noisy_norm = noisy_norm.to(device)
             sigma = sigma.to(device)
+            mask = mask.to(device)
             bsz = noisy_norm.size(0)
 
-            t = torch.randint(0, args.T, (bsz,), device=device)     # sample timesteps
-
-            xt, noise = diffusion.q_sample(noisy_norm, t)       # forward diffusion
-
+            t = torch.randint(0, args.T, (bsz,), device=device)
+            xt, noise = diffusion.q_sample(noisy_norm, t)
             pred_noise = model(xt, t)
 
             # training diagnostics
             if i == 0:
+                print("model device:", next(model.parameters()).device)
+                print("batch device:", noisy_norm.device, sigma.device, mask.device)
+                print("current cuda:", torch.cuda.current_device() if torch.cuda.is_available() else None)
                 def _stats(x):
                     return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
 
@@ -131,7 +152,10 @@ def train_diffusion(args):
                 snr_imp_norm = true_noise_norm.std() / res_noise_norm.std()
                 print(f"[CHECK] Epoch {epoch} SNR improvement (norm): {snr_imp_norm:.2f}x") # SNR improvement
 
-            loss = criterion(pred_noise, noise)
+            mse = (pred_noise - noise) ** 2
+            denom = mask.sum(dim=[1, 2]).clamp_min(1.0)  # unpadded points per sample
+            loss = (mse * mask).sum(dim=[1, 2]) / denom  # masked MSE
+            loss = loss.mean()  # average over batch
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
