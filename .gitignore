@@ -3,7 +3,7 @@ __pycache__/
 .idea/
 
 /data/
-
+plots/
 model/
 
 logs/
