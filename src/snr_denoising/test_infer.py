@@ -292,7 +292,6 @@ def main():
             noisy_raw  = item["noisy_raw"].to(device)
             sigma      = item["sigma"].to(device)
 
-            # if crop, mask to numpy
             mask_tensor = item["mask"]
             mask_np = mask_tensor.cpu().numpy().astype(bool)
             mask_1d = mask_np[0] if mask_np.ndim == 2 else mask_np
