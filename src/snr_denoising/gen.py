@@ -24,7 +24,6 @@ Output:
 _PSD_CACHE = {}
 
 
-
 def generate_ligo_waveform(
     mass1,
     mass2,
@@ -126,7 +125,81 @@ def generate_ligo_waveform(
     }
 
 
-def collect_samples(sample_specs, plot_flag=False, progress_every=0):
+def _gen_with_fallbacks(base_kwargs, seed, plot, fallback_flows, fallback_approxs):
+    """
+    Try your original generate_ligo_waveform first (unchanged)
+      --> lower f_lower values via the same function.
+    """
+    try:
+        return generate_ligo_waveform(**base_kwargs, random_seed=seed, plot=plot)
+    except Exception:
+        pass
+
+
+    for fl in fallback_flows:
+        try:
+            kw = {**base_kwargs, 'f_lower': float(fl)}
+            return generate_ligo_waveform(**kw, random_seed=seed, plot=plot)
+        except Exception:
+            continue
+
+    # (c) last resort: direct PyCBC with alternative approximants (keeps your original function intact)
+    delta_t = 1.0 / float(base_kwargs.get('sampling_rate', 4096))
+
+    m1 = base_kwargs['mass1']; m2 = base_kwargs['mass2']
+    s1 = base_kwargs.get('spin1z', 0.0); s2 = base_kwargs.get('spin2z', 0.0)
+    distance = base_kwargs.get('distance', 410.0)
+    f_lower_base  = float(base_kwargs.get('f_lower', 20.0))
+    sampling_rate = int(base_kwargs.get('sampling_rate', 4096))
+    detector = base_kwargs.get('detector', 'H1')
+    ra = float(base_kwargs.get('ra', 0.0)); dec = float(base_kwargs.get('dec', 0.0))
+    pol = float(base_kwargs.get('polarization', 0.0))
+    target_snr = float(base_kwargs['target_snr'])
+
+    for ap in fallback_approxs:
+        for fl in [f_lower_base] + list(fallback_flows):
+            try:
+                hp, hc = get_td_waveform(
+                    approximant=ap,
+                    mass1=m1, mass2=m2,
+                    spin1z=s1, spin2z=s2,
+                    distance=distance,
+                    delta_t=1.0/sampling_rate,
+                    f_lower=float(fl)
+                )
+                det = Detector(detector)
+                signal = det.project_wave(hp, hc, ra, dec, pol)
+                waveform_epoch = signal._epoch
+
+                df = 1.0 / (len(signal) * (1.0/sampling_rate))
+                psd = aLIGOZeroDetHighPower(len(signal)//2 + 1, df, float(fl))
+                current_snr = sigma(signal, psd=psd, low_frequency_cutoff=float(fl))
+                scaled_signal = signal * (target_snr / current_snr)
+
+                noise = noise_from_psd(len(signal), 1.0/sampling_rate, psd, seed=seed)
+                noise._epoch = waveform_epoch
+                noisy_signal = scaled_signal + noise
+
+                start_time = float(waveform_epoch)
+                times = np.arange(len(signal)) * (1.0/sampling_rate) + start_time
+
+                return {
+                    'signal': scaled_signal,
+                    'noise': noise,
+                    'noisy_signal': noisy_signal,
+                    'times': times,
+                    'snr': target_snr,
+                    'detector': detector,
+                    'epoch': waveform_epoch
+                }
+            except Exception:
+                continue
+
+    raise RuntimeError(f"All fallbacks failed for (m1,m2)=({m1},{m2}).")
+
+
+def collect_samples(sample_specs, plot_flag=False, progress_every=0,
+                    approx_fallbacks=None, flow_fallbacks=None):
     """
     Generate all samples from a list of specs (each spec is kwargs for generate_ligo_waveform),
     generator enforces m1 >= m2 for use. NOTE for arg.augment_symmetric this simply relables
@@ -176,7 +249,9 @@ def collect_samples(sample_specs, plot_flag=False, progress_every=0):
 
         try:
             plot_this = plot_flag and i < 3
-            res = generate_ligo_waveform(**call_kwargs, random_seed=i, plot=plot_this)
+            res = _gen_with_fallbacks(call_kwargs, seed=i, plot=plot_this,
+                                      fallback_flows=(flow_fallbacks or []),
+                                      fallback_approxs=(approx_fallbacks or []))
         except Exception as e:
             print(f"generation failed for labeled {spec}: {e}")
             continue
@@ -215,7 +290,6 @@ def collect_samples(sample_specs, plot_flag=False, progress_every=0):
         meta['chirp_mass'].append(Mchirp)
 
     return sig_list, noise_list, noisy_list, t_list, meta
-
 
 
 def finalize_and_write(
@@ -296,14 +370,11 @@ def finalize_and_write(
     print(f"saved {N} samples (padding={padding_mode}, {pad_attr_name}={pad_attr_val}) --> {output_path}")
 
 
-
 if __name__ == "__main__":
     import argparse
 
-
     class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
         pass
-
 
     parser = argparse.ArgumentParser(
         prog="gen.py",
@@ -371,6 +442,8 @@ if __name__ == "__main__":
     g_grid.add_argument('--overgen-factor', type=float, default=1.05,
                         help='Over-generate by this fraction then trim back to exactly --num-samples. '
                              'Useful because a few combos/noise draws can be rejected by the simulator.')
+    g_grid.add_argument('--require-complete-grid', action='store_true',
+                        help='If set, raise an error if any (m1,m2) pair fails all probe attempts.')
 
     # PADDING OPTIONS
     g_pad = parser.add_argument_group("Padding")
@@ -391,10 +464,25 @@ if __name__ == "__main__":
                         help='Plot the first few generated examples for a quick visual check.')
     g_misc.add_argument('--progress-every', type=int, default=0,
                         help='If > 0, print progress every N items during probe/build/generation.')
+    # Tunables + fallbacks (NEW)
+    g_misc.add_argument('--f-lower', type=float, default=20.0,
+                        help='Base low-frequency cutoff passed to get_td_waveform.')
+    g_misc.add_argument('--sampling-rate', type=int, default=4096,
+                        help='Base sampling rate (Hz).')
+    g_misc.add_argument('--fallback-f-lowers', type=str, default='15,10',
+                        help='Comma-separated list of alternate f_lower values to try on failure.')
+    g_misc.add_argument('--fallback-approximants', type=str, default='IMRPhenomD,IMRPhenomPv2',
+                        help='Comma-separated list of alternative approximants to try if base settings fail.')
 
     args = parser.parse_args()
 
     import json
+
+    def _parse_list(s):
+        return [x.strip() for x in str(s).split(',') if x.strip()]
+
+    fallback_flows  = [float(x) for x in _parse_list(args.fallback_f_lowers)]
+    fallback_approxs = _parse_list(args.fallback_approximants)
 
     args_json = json.dumps(vars(args), sort_keys=True)
     if args.mass2_min > args.mass1_max:
@@ -407,30 +495,32 @@ if __name__ == "__main__":
             dict(
                 mass1=args.mass1, mass2=args.mass2, target_snr=args.snr,
                 spin1z=0.0, spin2z=0.0, distance=410.0,
-                f_lower=20.0, sampling_rate=4096, detector="H1",
+                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
                 ra=0.0, dec=0.0, polarization=0.0
             )
             for _ in range(args.num_samples)
         ]
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
+            sample_specs, plot_flag=args.plot, progress_every=args.progress_every,
+            approx_fallbacks=fallback_approxs, flow_fallbacks=fallback_flows
+        )
 
         phys_len = None
         if args.padding == 'physical_max':
             phys_len = len(generate_ligo_waveform(
                 mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
                 spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=20.0, sampling_rate=4096, detector="H1",
+                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
                 ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
             )['signal'])
         finalize_and_write(
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
             padding_mode=args.padding,
-            sampling_rate=4096,
+            sampling_rate=args.sampling_rate,
             physical_len=phys_len,
             attrs_extra={'mode': 'fixed', 'config_args': args_json}
         )
-
 
     elif args.mode == 'random':
         sample_specs = []
@@ -449,12 +539,14 @@ if __name__ == "__main__":
             spec = dict(
                 mass1=m1_val, mass2=m2_val, target_snr=snr_val,
                 spin1z=s1_val, spin2z=s2_val, distance=410.0,
-                f_lower=20.0, sampling_rate=4096, detector="H1",
+                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
                 ra=0.0, dec=0.0, polarization=0.0
             )
             # quick probe to avoid counting failures
             try:
-                _ = generate_ligo_waveform(**spec, random_seed=attempts, plot=False)
+                _ = _gen_with_fallbacks(spec, seed=attempts, plot=False,
+                                        fallback_flows=fallback_flows,
+                                        fallback_approxs=fallback_approxs)
             except Exception as e:
                 print(
                     f"skipped ({attempts}) m1={m1_val:.1f}, m2={m2_val:.1f}, s1={s1_val:.2f}, s2={s2_val:.2f}, snr={snr_val:.1f} --> {e}")
@@ -466,17 +558,19 @@ if __name__ == "__main__":
 
         if successes < args.num_samples:
             raise RuntimeError(f"unable to collect enough valid samples: {successes}/{args.num_samples} "
-
                                f"(attempted {attempts}). please narrow ranges.")
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
+            sample_specs, plot_flag=args.plot, progress_every=args.progress_every,
+            approx_fallbacks=fallback_approxs, flow_fallbacks=fallback_flows
+        )
 
         phys_len = None
         if args.padding == 'physical_max':
             phys_len = len(generate_ligo_waveform(
                 mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
                 spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=20.0, sampling_rate=4096, detector="H1",
+                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
                 ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
             )['signal'])
 
@@ -484,7 +578,7 @@ if __name__ == "__main__":
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
             padding_mode=args.padding,
-            sampling_rate=4096,
+            sampling_rate=args.sampling_rate,
             physical_len=phys_len,
             attrs_extra={'mode': 'random', 'config_args': args_json}
         )
@@ -503,24 +597,31 @@ if __name__ == "__main__":
                   for m1, m2 in itertools.product(m1_vals, m2_vals)
                   if m2 <= m1]
         valid_combos = []
+        missing = []
         total_probe = len(combos)
         for pi, (m1, m2) in enumerate(combos):
+            spec_probe = dict(
+                mass1=max(m1, m2), mass2=min(m1, m2),
+                target_snr=20.0,
+                spin1z=0.0, spin2z=0.0,
+                distance=410.0, f_lower=args.f_lower,
+                sampling_rate=args.sampling_rate, detector="H1",
+                ra=0.0, dec=0.0, polarization=0.0
+            )
             try:
-                _ = generate_ligo_waveform(
-                    mass1=max(m1, m2), mass2=min(m1, m2),
-                    target_snr=20.0,
-                    spin1z=0.0, spin2z=0.0,
-                    distance=410.0, f_lower=20.0,
-                    sampling_rate=4096, detector="H1",
-                    ra=0.0, dec=0.0, polarization=0.0,
-                    random_seed=0, plot=False
-                )
+                _ = _gen_with_fallbacks(spec_probe, seed=0, plot=False,
+                                        fallback_flows=fallback_flows,
+                                        fallback_approxs=fallback_approxs)
                 valid_combos.append((m1, m2))
             except Exception as e:
+                missing.append((m1, m2))
                 print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}", flush=True)
 
             if args.progress_every and ((pi + 1) % args.progress_every == 0 or (pi + 1) == total_probe):
                 print(f"[grid] probe {pi + 1}/{total_probe} | valid={len(valid_combos)}", flush=True)
+
+        if args.require_complete_grid and missing:
+            raise RuntimeError(f"Grid not complete; missing {len(missing)} combos: {missing}")
 
         combos = valid_combos
         C = len(combos)
@@ -533,7 +634,6 @@ if __name__ == "__main__":
 
         def draw_spin(min_v, max_v):
             return float(min_v) if min_v == max_v else float(rng.uniform(min_v, max_v))
-
 
         sample_specs = []
         built = 0
@@ -556,8 +656,8 @@ if __name__ == "__main__":
                         mass1=m1, mass2=m2,
                         spin1z=s1, spin2z=s2,
                         target_snr=snr_val,
-                        distance=410.0, f_lower=20.0,
-                        sampling_rate=4096, detector="H1",
+                        distance=410.0, f_lower=args.f_lower,
+                        sampling_rate=args.sampling_rate, detector="H1",
                         ra=0.0, dec=0.0, polarization=0.0,
                         label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
                     )
@@ -576,8 +676,8 @@ if __name__ == "__main__":
                         mass1=m2, mass2=m1,  # swapped intended labels
                         spin1z=s2, spin2z=s1,  # spins swapped with labels
                         target_snr=snr_val,
-                        distance=410.0, f_lower=20.0,
-                        sampling_rate=4096, detector="H1",
+                        distance=410.0, f_lower=args.f_lower,
+                        sampling_rate=args.sampling_rate, detector="H1",
                         ra=0.0, dec=0.0, polarization=0.0,
                         label_m1=m2, label_m2=m1, label_s1=s2, label_s2=s1
                     )
@@ -588,8 +688,7 @@ if __name__ == "__main__":
                         print(f"built specs {built}/{N_target}", flush=True)
 
             else:
-                # Option A (unordered only): all intended labels are (m1,m2)
-
+                # Option A (for unordered only): all labels are (m1,m2)
                 for _ in range(count):
                     s1 = draw_spin(args.spin1_min, args.spin1_max)
                     s2 = draw_spin(args.spin2_min, args.spin2_max)
@@ -598,8 +697,8 @@ if __name__ == "__main__":
                         mass1=m1, mass2=m2,
                         spin1z=s1, spin2z=s2,
                         target_snr=snr_val,
-                        distance=410.0, f_lower=20.0,
-                        sampling_rate=4096, detector="H1",
+                        distance=410.0, f_lower=args.f_lower,
+                        sampling_rate=args.sampling_rate, detector="H1",
                         ra=0.0, dec=0.0, polarization=0.0,
                         label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
                     )
@@ -609,11 +708,13 @@ if __name__ == "__main__":
                     if args.progress_every and (built % args.progress_every == 0):
                         print(f"built specs {built}/{N_target}", flush=True)
 
-
         if args.shuffle:        # optional shuffle for HDF5 ordering
             rng.shuffle(sample_specs)
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(sample_specs, plot_flag=args.plot, progress_every=args.progress_every)
+        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
+            sample_specs, plot_flag=args.plot, progress_every=args.progress_every,
+            approx_fallbacks=fallback_approxs, flow_fallbacks=fallback_flows
+        )
 
         succ = len(sig_list)
         if succ >= args.num_samples:
@@ -634,7 +735,7 @@ if __name__ == "__main__":
             phys_len = len(generate_ligo_waveform(
                 mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
                 spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=20.0, sampling_rate=4096, detector="H1",
+                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
                 ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
             )['signal'])
 
@@ -642,12 +743,12 @@ if __name__ == "__main__":
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
             padding_mode=args.padding,
-            sampling_rate=4096,
+            sampling_rate=args.sampling_rate,
             physical_len=phys_len,
             attrs_extra={
                 'mode': 'grid',
                 'grid_steps': int(n),
-                'num_combos': int(C),
+                'num_combos': int(len(combos)),
                 'snr_min': float(args.snr_min),
                 'snr_max': float(args.snr_max),
                 'augment_symmetric': bool(args.augment_symmetric),
@@ -657,5 +758,3 @@ if __name__ == "__main__":
                 'config_args': args_json
             }
         )
-
-
