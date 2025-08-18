@@ -8,6 +8,7 @@ from pycbc.psd import aLIGOZeroDetHighPower
 from pycbc.filter import sigma
 import os
 import h5py
+import json
 
 """
 gen.py — Generate time-domain GW waveforms with LIGO-like noise, and write HDF5 datasets with separate properties.
@@ -20,9 +21,16 @@ Modes:
 Output:
   HDF5 containing signal/noise/noisy, times or mask (depending on padding), metadata and gen mode.
 
-This version has **no fallbacks**. If a combo fails (e.g., SEOBNRv4 at given f_lower), it is skipped.
-Optionally require a complete grid via --require-complete-grid to hard-fail if anything is missing.
+This version has **no fallbacks**. If a combo fails (e.g., SEOBNRv4 at given f_lower), it is skipped — or,
+with --require-complete-grid, the run aborts and tells you to adjust --f-lower (or ranges).
 """
+
+# Optional progress bars
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
 
 # PSD cache to avoid recomputing PSD interpolation on every call
 _PSD_CACHE = {}
@@ -121,24 +129,48 @@ def generate_ligo_waveform(
     }
 
 
-def collect_samples(sample_specs, plot_flag=False, progress_every=0):
+def _maybe_tqdm(iterable, total=None, desc=None, use_tqdm=True):
+    if use_tqdm and _HAS_TQDM:
+        return tqdm(iterable, total=total, desc=desc)
+    return iterable
+
+
+def collect_samples(
+    sample_specs,
+    plot_flag=False,
+    progress_every=0,
+    save_psd=False,
+    psd_preview=0,
+    psd_preview_dir=None,
+    use_tqdm=True
+):
     """
     Generate samples from a list of specs (kwargs for generate_ligo_waveform).
     Enforces m1 >= m2 for generation safety (labels may be unsorted if in args).
 
     Each spec must contain at least: mass1, mass2, target_snr, spin1z, spin2z
     """
+    os.makedirs(psd_preview_dir, exist_ok=True) if (psd_preview and psd_preview_dir) else None
+
     sig_list, noise_list, noisy_list, t_list = [], [], [], []
 
     meta = {k: [] for k in [
         'mass1','mass2','snr','spin1z','spin2z',
         'label_m1','label_m2','label_s1','label_s2',
-        'q','chirp_mass'
+        'q','chirp_mass',
+        'epoch',
+        # PSD metadata
+        'psd_len','psd_df','psd_f_lower'
     ]}
-    meta['epoch'] = []
+    detectors = []
+    full_psd_list = [] if save_psd else None
 
-    for i, spec in enumerate(sample_specs):
-        # labels to record (may be swapped separately for symmetric augmentation)
+    iterable = _maybe_tqdm(range(len(sample_specs)), total=len(sample_specs),
+                           desc="Generating samples", use_tqdm=use_tqdm)
+
+    for i in iterable:
+        spec = sample_specs[i]
+        # labels
         Lm1 = spec.get('label_m1', spec['mass1'])
         Lm2 = spec.get('label_m2', spec['mass2'])
         Ls1 = spec.get('label_s1', spec['spin1z'])
@@ -150,16 +182,18 @@ def collect_samples(sample_specs, plot_flag=False, progress_every=0):
         if m1 < m2:
             m1, m2, s1, s2 = m2, m1, s2, s1
 
+        f_lower = float(spec.get('f_lower', 20.0))
+        sr = int(spec.get('sampling_rate', 4096))
+        detector = spec.get('detector', 'H1')
+
         call_kwargs = {
-            'mass1': m1,
-            'mass2': m2,
+            'mass1': m1, 'mass2': m2,
             'target_snr': float(spec['target_snr']),
-            'spin1z': s1,
-            'spin2z': s2,
+            'spin1z': s1, 'spin2z': s2,
             'distance': float(spec.get('distance', 410.0)),
-            'f_lower': float(spec.get('f_lower', 20.0)),
-            'sampling_rate': int(spec.get('sampling_rate', 4096)),
-            'detector': spec.get('detector', 'H1'),
+            'f_lower': f_lower,
+            'sampling_rate': sr,
+            'detector': detector,
             'ra': float(spec.get('ra', 0.0)),
             'dec': float(spec.get('dec', 0.0)),
             'polarization': float(spec.get('polarization', 0.0)),
@@ -169,17 +203,53 @@ def collect_samples(sample_specs, plot_flag=False, progress_every=0):
             plot_this = plot_flag and i < 3
             res = generate_ligo_waveform(**call_kwargs, random_seed=i, plot=plot_this)
         except Exception as e:
-            print(f"generation failed for labeled {spec}: {e}")
+            if not use_tqdm and progress_every:
+                print(f"generation failed idx={i} for labeled {spec}: {e}")
             continue
 
-        sig_list.append(res['signal'].numpy())
-        noise_list.append(res['noise'].numpy())
-        noisy_list.append(res['noisy_signal'].numpy())
+        # Save arrays
+        sig_np = res['signal'].numpy()
+        noi_np = res['noise'].numpy()
+        noz_np = res['noisy_signal'].numpy()
+
+        sig_list.append(sig_np)
+        noise_list.append(noi_np)
+        noisy_list.append(noz_np)
         t_list.append(res['times'])
 
-        if progress_every and ((i + 1) % progress_every == 0 or (i + 1) == len(sample_specs)):
-            print(f"generated {i + 1}/{len(sample_specs)}")
+        # PSD metadata
+        N = len(sig_np)
+        delta_t = 1.0 / sr
+        df = 1.0 / (N * delta_t)
+        meta['psd_len'].append(N // 2 + 1)
+        meta['psd_df'].append(df)
+        meta['psd_f_lower'].append(f_lower)
+        detectors.append(detector.encode('utf-8'))
 
+        # Optional full PSD vector
+        if full_psd_list is not None:
+            psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy().astype(np.float32)
+            full_psd_list.append(psd_vec)
+
+        # Optional PSD previews
+        if psd_preview and (len(sig_list) <= psd_preview) and psd_preview_dir:
+            psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy()
+            f = np.arange(psd_vec.shape[0]) * df
+            asd = np.sqrt(psd_vec + 1e-30)
+            plt.figure(figsize=(6, 4))
+            plt.loglog(f[1:], asd[1:])
+            plt.xlabel("Frequency (Hz)"); plt.ylabel("ASD (1/√Hz)")
+            plt.title(f"PSD (ASD) — {detector}, f_low={f_lower:g} Hz, N={N}, Δt={delta_t:.6g}")
+            plt.grid(True, which='both', ls=':')
+            os.makedirs(psd_preview_dir, exist_ok=True)
+            plt.savefig(os.path.join(psd_preview_dir, f"psd_{len(sig_list):05d}.png"), dpi=150, bbox_inches='tight')
+            plt.close()
+
+        if (not _HAS_TQDM or not use_tqdm) and progress_every:
+            if ((i + 1) % progress_every == 0) or ((i + 1) == len(sample_specs)):
+                print(f"generated {i + 1}/{len(sample_specs)}")
+
+        # metadata
         meta['epoch'].append(float(res['epoch']))
         meta['mass1'].append(m1);          meta['mass2'].append(m2)
         meta['spin1z'].append(s1);         meta['spin2z'].append(s2)
@@ -194,7 +264,7 @@ def collect_samples(sample_specs, plot_flag=False, progress_every=0):
         meta['q'].append(q)
         meta['chirp_mass'].append(Mchirp)
 
-    return sig_list, noise_list, noisy_list, t_list, meta
+    return sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list
 
 
 def finalize_and_write(
@@ -203,29 +273,61 @@ def finalize_and_write(
     padding_mode,
     sampling_rate,
     physical_len=None,
-    attrs_extra=None
+    attrs_extra=None,
+    detectors_bytes=None,
+    full_psd_list=None,
+    time_axis="index"  # NEEDS REWORK
 ):
     """Apply padding strategy and write HDF5 with a consistent layout."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     lengths = np.array([len(x) for x in sig_list], dtype=np.int32)
+    delta_t = 1.0 / float(sampling_rate)
+
+    def _write_common(f):
+        for k, arr in meta.items():
+            if arr:
+                f.create_dataset(k, data=np.array(arr, dtype=np.float32))
+        if detectors_bytes is not None:
+            vlen_str = h5py.special_dtype(vlen=bytes)
+            f.create_dataset('psd_detector', data=np.array(detectors_bytes, dtype=object), dtype=vlen_str)
+
+        # PSD full vectors
+        if full_psd_list is not None:
+            vlen_f32 = h5py.special_dtype(vlen=np.float32)
+            f.create_dataset('psd', (len(full_psd_list),), dtype=vlen_f32, data=full_psd_list)
+
+        # attrs
+        f.attrs['padding'] = padding_mode
+        f.attrs['sampling_rate'] = float(sampling_rate)
+        f.attrs['delta_t'] = float(delta_t)
+        f.attrs['time_axis'] = time_axis
+        if attrs_extra:
+            for k, v in attrs_extra.items():
+                f.attrs[k] = v
 
     if padding_mode == 'none':
+        # Variable-length storage per sample
         vlen_f32 = h5py.special_dtype(vlen=np.float32)
         vlen_f64 = h5py.special_dtype(vlen=np.float64)
+
+        # Build per-sample times according to time_axis
+        if time_axis == "index":
+            times_vlen = [np.arange(L, dtype=np.float64) for L in lengths]
+        elif time_axis == "seconds-rel":
+            # 0 at merger: subtract last valid time
+            times_vlen = [t - t[-1] for t in t_list]
+        elif time_axis == "seconds-abs":
+            times_vlen = t_list
+        else:
+            raise ValueError(f"Unknown time_axis: {time_axis}")
+
         with h5py.File(output_path, 'w') as f:
             f.create_dataset('signal', (len(sig_list),), dtype=vlen_f32, data=sig_list)
             f.create_dataset('noise',  (len(noise_list),), dtype=vlen_f32, data=noise_list)
             f.create_dataset('noisy',  (len(noisy_list),), dtype=vlen_f32, data=noisy_list)
-            f.create_dataset('times',  (len(t_list),),   dtype=vlen_f64, data=t_list)
+            f.create_dataset('times',  (len(times_vlen),), dtype=vlen_f64, data=times_vlen)
             f.create_dataset('lengths', data=lengths)
-            f.attrs['padding'] = 'none'
-            f.attrs['sampling_rate'] = float(sampling_rate)
-            if attrs_extra:
-                for k, v in attrs_extra.items():
-                    f.attrs[k] = v
-            for k, arr in meta.items():
-                if arr:
-                    f.create_dataset(k, data=np.array(arr, dtype=np.float32))
+            _write_common(f)
         print(f"saved {len(sig_list)} samples (padding=none) --> {output_path}")
         return
 
@@ -240,8 +342,8 @@ def finalize_and_write(
     else:
         raise ValueError(f"unrecognised padding_mode: {padding_mode}")
 
-    delta_t = 1.0 / float(sampling_rate)
-    times = np.arange(target_len) * delta_t
+    # Build a single global base time vector (seconds from start index 0)
+    times_base = np.arange(target_len) * delta_t
 
     N = len(sig_list)
     signals = np.zeros((N, target_len), dtype=np.float32)
@@ -257,7 +359,6 @@ def finalize_and_write(
         mask[i,    :Lc] = 1.0
 
     with h5py.File(output_path, 'w') as f:
-        f.create_dataset('times',   data=times)
         chunk_len = min(16384, target_len)
         dset_kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=(1, chunk_len))
 
@@ -265,17 +366,30 @@ def finalize_and_write(
         f.create_dataset('noise',  data=noises,  **dset_kwargs)
         f.create_dataset('noisy',  data=noisy,   **dset_kwargs)
         f.create_dataset('mask',   data=mask,    **dset_kwargs)
-
         f.create_dataset('lengths', data=lengths)
-        f.attrs['padding'] = padding_mode
-        f.attrs['sampling_rate'] = float(sampling_rate)
+
+        # collect the base time grid and any needed per-sample offsets
+        if time_axis == "index":
+            f.create_dataset('times', data=np.arange(target_len, dtype=np.float64))
+            f.attrs['times_interpretation'] = "index"
+        elif time_axis == "seconds-rel":
+            # store base seconds from index 0, plus a per-sample offset so last valid is 0
+            f.create_dataset('times', data=times_base.astype(np.float64))
+            t_rel0 = -(lengths.astype(np.int64) - 1) * delta_t
+            f.create_dataset('t_rel0', data=t_rel0.astype(np.float64))
+            f.attrs['times_interpretation'] = "seconds_rel_via_offset"
+            # reconstruct: t_rel(i,k) = times[k] + t_rel0[i]
+        elif time_axis == "seconds-abs":
+            # store base seconds from start; "absolute time = epoch[i] + times[k]"
+            f.create_dataset('times', data=times_base.astype(np.float64))
+            f.attrs['times_interpretation'] = "seconds_abs_via_epoch"
+            # reconstruct: t_abs(i,k) = epoch[i] + times[k]
+        else:
+            raise ValueError(f"Unknown time_axis: {time_axis}")
+
         f.attrs[pad_attr_name] = pad_attr_val
-        if attrs_extra:
-            for k, v in attrs_extra.items():
-                f.attrs[k] = v
-        for k, arr in meta.items():
-            if arr:
-                f.create_dataset(k, data=np.array(arr, dtype=np.float32))
+        _write_common(f)
+
     print(f"saved {N} samples (padding={padding_mode}, {pad_attr_name}={pad_attr_val}) --> {output_path}")
 
 
@@ -296,8 +410,8 @@ if __name__ == "__main__":
             "OUTPUT\n"
             "  HDF5 containing:\n"
             "    - signal/noise/noisy arrays\n"
-            "    - times (variable-length mode) OR (times, mask) in padded modes\n"
-            "    - metadata per sample (masses, spins, SNR, epoch, symmetric helpers like q, chirp_mass)\n"
+            "    - times (variable-length mode) OR (times base + offsets) in padded modes\n"
+            "    - metadata per sample (masses, spins, SNR, epoch, PSD metadata, etc.)\n"
         ),
         formatter_class=_HelpFmt,
     )
@@ -343,7 +457,7 @@ if __name__ == "__main__":
     g_grid.add_argument('--overgen-factor', type=float, default=1.05,
                         help='Over-generate by this fraction then trim back to exactly --num-samples.')
     g_grid.add_argument('--require-complete-grid', action='store_true',
-                        help='If set, raise an error if any (m1,m2) pair fails during the probe step.')
+                        help='If set, raise an error if any (m1,m2) pair fails during the probe step (tip: try adjusting --f-lower).')
 
     # PADDING
     g_pad = parser.add_argument_group("Padding")
@@ -357,16 +471,38 @@ if __name__ == "__main__":
     g_pad.add_argument('--phys-s1', type=float, default=0.0, help='Reference spin1z for physical_max padding.')
     g_pad.add_argument('--phys-s2', type=float, default=0.0, help='Reference spin2z for physical_max padding.')
 
-    # MISC physics controls (uniform across all modes)
-    g_misc = parser.add_argument_group("Physics")
+    # MISC / TUNABLES
+    g_misc = parser.add_argument_group("Misc")
+    g_misc.add_argument('--plot', action='store_true',
+                        help='Plot the first few generated examples for a quick visual check.')
+    g_misc.add_argument('--progress-every', type=int, default=0,
+                        help='Print progress every N items when tqdm is unavailable or disabled.')
+    g_misc.add_argument('--use-tqdm', action='store_true',
+                        help='Use tqdm progress bars if installed.')
     g_misc.add_argument('--f-lower', type=float, default=20.0,
-                        help='Low-frequency cutoff passed to get_td_waveform (uniform, no fallbacks).')
+                        help='Base low-frequency cutoff passed to get_td_waveform.')
     g_misc.add_argument('--sampling-rate', type=int, default=4096,
-                        help='Sampling rate (Hz).')
+                        help='Base sampling rate (Hz).')
+
+    # PSD options
+    g_psd = parser.add_argument_group("PSD options")
+    g_psd.add_argument('--save-psd', action='store_true',
+                       help='Store the full PSD vector per sample in the HDF5 (variable-length).')
+    g_psd.add_argument('--psd-preview', type=int, default=0,
+                       help='If > 0, save this many PSD ASD plots to disk.')
+    g_psd.add_argument('--psd-preview-dir', type=str, default=None,
+                       help='Directory for PSD preview images; defaults to <output_dir>/psd_plots.')
+
+    # Time axis selection
+    g_time = parser.add_argument_group("Time axis")
+    g_time.add_argument('--time-axis', choices=['index', 'seconds-rel', 'seconds-abs'], default='index',
+                        help=("How to store the time axis:\n"
+                              "  index       : sample index (0..L-1)\n"
+                              "  seconds-rel : seconds with merger at t=0 (last valid sample)\n"
+                              "  seconds-abs : absolute seconds using per-sample 'epoch' (padded modes store base + epoch)\n"))
 
     args = parser.parse_args()
 
-    import json
     args_json = json.dumps(vars(args), sort_keys=True)
 
     if args.mass2_min > args.mass1_max:
@@ -374,6 +510,11 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+
+    # Default PSD preview dir next to output
+    if args.psd_preview and not args.psd_preview_dir:
+        base_dir = os.path.dirname(args.output_path)
+        args.psd_preview_dir = os.path.join(base_dir, "psd_plots")
 
     if args.mode == 'fixed':
         sample_specs = [
@@ -385,8 +526,14 @@ if __name__ == "__main__":
             )
             for _ in range(args.num_samples)
         ]
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
-            sample_specs, plot_flag=args.plot, progress_every=args.progress_every
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+            sample_specs,
+            plot_flag=args.plot,
+            progress_every=args.progress_every,
+            save_psd=args.save_psd,
+            psd_preview=args.psd_preview,
+            psd_preview_dir=args.psd_preview_dir,
+            use_tqdm=args.use_tqdm
         )
 
         phys_len = None
@@ -409,7 +556,10 @@ if __name__ == "__main__":
                 'f_lower': float(args.f_lower),
                 'sampling_rate': int(args.sampling_rate),
                 'config_args': args_json
-            }
+            },
+            detectors_bytes=detectors,
+            full_psd_list=full_psd_list,
+            time_axis=args.time_axis
         )
 
     elif args.mode == 'random':
@@ -445,11 +595,19 @@ if __name__ == "__main__":
                 print(f"{successes}/{args.num_samples} collected")
 
         if successes < args.num_samples:
-            raise RuntimeError(f"unable to collect enough valid samples: {successes}/{args.num_samples} (attempted {attempts}). "
-                               f"please narrow ranges or adjust f-lower.")
+            raise RuntimeError(
+                f"unable to collect enough valid samples: {successes}/{args.num_samples} (attempted {attempts}). "
+                f"please narrow ranges or adjust --f-lower."
+            )
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
-            sample_specs, plot_flag=args.plot, progress_every=args.progress_every
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+            sample_specs,
+            plot_flag=args.plot,
+            progress_every=args.progress_every,
+            save_psd=args.save_psd,
+            psd_preview=args.psd_preview,
+            psd_preview_dir=args.psd_preview_dir,
+            use_tqdm=args.use_tqdm
         )
 
         phys_len = None
@@ -473,7 +631,10 @@ if __name__ == "__main__":
                 'f_lower': float(args.f_lower),
                 'sampling_rate': int(args.sampling_rate),
                 'config_args': args_json
-            }
+            },
+            detectors_bytes=detectors,
+            full_psd_list=full_psd_list,
+            time_axis=args.time_axis
         )
 
     elif args.mode == 'grid':
@@ -490,9 +651,11 @@ if __name__ == "__main__":
 
         valid_combos = []
         missing = []
-        total_probe = len(combos_all)
 
-        for pi, (m1, m2) in enumerate(combos_all):
+        iterable = _maybe_tqdm(enumerate(combos_all), total=len(combos_all),
+                               desc="Probing grid", use_tqdm=args.use_tqdm)
+
+        for pi, (m1, m2) in iterable:
             spec_probe = dict(
                 mass1=max(m1, m2), mass2=min(m1, m2),
                 target_snr=20.0,
@@ -506,18 +669,23 @@ if __name__ == "__main__":
                 valid_combos.append((m1, m2))
             except Exception as e:
                 missing.append((m1, m2))
-                print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}", flush=True)
+                if not _HAS_TQDM or not args.use_tqdm:
+                    print(f"[probe] excluding combo (m1={m1}, m2={m2}) --> {e}", flush=True)
 
-            if args.progress_every and ((pi + 1) % args.progress_every == 0 or (pi + 1) == total_probe):
-                print(f"[grid] probe {pi + 1}/{total_probe} | valid={len(valid_combos)}", flush=True)
+            if (not _HAS_TQDM or not args.use_tqdm) and args.progress_every:
+                if ((pi + 1) % args.progress_every == 0) or ((pi + 1) == len(combos_all)):
+                    print(f"[grid] probe {pi + 1}/{len(combos_all)} | valid={len(valid_combos)}", flush=True)
 
         if args.require_complete_grid and missing:
-            raise RuntimeError(f"Grid not complete at f_lower={args.f_lower} Hz; missing {len(missing)} combos: {missing}")
+            raise RuntimeError(
+                f"Grid not complete at f_lower={args.f_lower} Hz; missing {len(missing)} combos: {missing}\n"
+                f"Tip: try adjusting --f-lower (e.g., a little higher) or narrowing mass ranges."
+            )
 
         combos = valid_combos
         C = len(combos)
         if C == 0:
-            raise RuntimeError("no valid (m1,m2) combos after probe. ADJUST f_lower or ranges.")
+            raise RuntimeError("no valid (m1,m2) combos after probe. ADJUST --f-lower or ranges.")
 
         N_target = int(np.ceil(args.num_samples * args.overgen_factor))
         base = N_target // C
@@ -529,13 +697,15 @@ if __name__ == "__main__":
         sample_specs = []
         built = 0
 
-        for idx, (m1, m2) in enumerate(combos):
+        iterable2 = _maybe_tqdm(enumerate(combos), total=len(combos),
+                                desc="Building specs", use_tqdm=args.use_tqdm)
+
+        for idx, (m1, m2) in iterable2:
             count = base + (1 if idx < rem else 0)
             if count <= 0:
                 continue
 
             if args.augment_symmetric:
-                # Half with labels (m1,m2), half with swapped labels (m2,m1)
                 count_a = count // 2
                 count_b = count - count_a
 
@@ -551,7 +721,6 @@ if __name__ == "__main__":
                         label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
                     )
                     sample_specs.append(spec); built += 1
-                    if args.progress_every and (built % args.progress_every == 0): print(f"built specs {built}/{N_target}", flush=True)
 
                 for _ in range(count_b):
                     s1 = draw_spin(args.spin1_min, args.spin1_max)
@@ -565,8 +734,6 @@ if __name__ == "__main__":
                         label_m1=m2, label_m2=m1, label_s1=s2, label_s2=s1
                     )
                     sample_specs.append(spec); built += 1
-                    if args.progress_every and (built % args.progress_every == 0): print(f"built specs {built}/{N_target}", flush=True)
-
             else:
                 for _ in range(count):
                     s1 = draw_spin(args.spin1_min, args.spin1_max)
@@ -580,13 +747,22 @@ if __name__ == "__main__":
                         label_m1=m1, label_m2=m2, label_s1=s1, label_s2=s2
                     )
                     sample_specs.append(spec); built += 1
-                    if args.progress_every and (built % args.progress_every == 0): print(f"built specs {built}/{N_target}", flush=True)
+
+            if (not _HAS_TQDM or not args.use_tqdm) and args.progress_every:
+                if ((idx + 1) % args.progress_every == 0) or ((idx + 1) == len(combos)):
+                    print(f"built specs {built}/{N_target}", flush=True)
 
         if args.shuffle:
             rng.shuffle(sample_specs)
 
-        sig_list, noise_list, noisy_list, t_list, meta = collect_samples(
-            sample_specs, plot_flag=args.plot, progress_every=args.progress_every
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+            sample_specs,
+            plot_flag=args.plot,
+            progress_every=args.progress_every,
+            save_psd=args.save_psd,
+            psd_preview=args.psd_preview,
+            psd_preview_dir=args.psd_preview_dir,
+            use_tqdm=args.use_tqdm
         )
 
         succ = len(sig_list)
@@ -596,6 +772,10 @@ if __name__ == "__main__":
             noisy_list = noisy_list[:keep]; t_list = t_list[:keep]
             for k in meta.keys():
                 meta[k] = meta[k][:keep]
+            if detectors is not None:
+                detectors = detectors[:keep]
+            if full_psd_list is not None:
+                full_psd_list = full_psd_list[:keep]
         else:
             print(f"[WARNING] only generated {succ}/{args.num_samples} after filtering failures. "
                   f"Try adjusting --overgen-factor or re-running.")
@@ -630,5 +810,8 @@ if __name__ == "__main__":
                 'overgen_factor': float(args.overgen_factor),
                 'require_complete_grid': bool(args.require_complete_grid),
                 'config_args': args_json
-            }
+            },
+            detectors_bytes=detectors,
+            full_psd_list=full_psd_list,
+            time_axis=args.time_axis
         )
