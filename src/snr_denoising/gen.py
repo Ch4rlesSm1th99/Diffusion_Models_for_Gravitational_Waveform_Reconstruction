@@ -19,13 +19,13 @@ Modes:
   - grid  : balanced coverage of (m1, m2) pairs in a grid (unordered: m2 <= m1)
 
 Output:
-  HDF5 containing signal/noise/noisy, times or mask (depending on padding), metadata and gen mode.
+  HDF5 containing variable-length signal/noise/noisy, per-sample times (seconds-relative with t=0 at merger),
+  metadata and gen mode.
 
 This version has **no fallbacks**. If a combo fails (e.g., SEOBNRv4 at given f_lower), it is skipped — or,
 with --require-complete-grid, the run aborts and tells you to adjust --f-lower (or ranges).
 """
 
-# Optional progress bars
 try:
     from tqdm import tqdm
     _HAS_TQDM = True
@@ -207,7 +207,6 @@ def collect_samples(
                 print(f"generation failed idx={i} for labeled {spec}: {e}")
             continue
 
-        # Save arrays
         sig_np = res['signal'].numpy()
         noi_np = res['noise'].numpy()
         noz_np = res['noisy_signal'].numpy()
@@ -270,15 +269,12 @@ def collect_samples(
 def finalize_and_write(
     output_path,
     sig_list, noise_list, noisy_list, t_list, meta,
-    padding_mode,
     sampling_rate,
-    physical_len=None,
     attrs_extra=None,
     detectors_bytes=None,
-    full_psd_list=None,
-    time_axis="index"  # NEEDS REWORK
+    full_psd_list=None
 ):
-    """Apply padding strategy and write HDF5 with a consistent layout."""
+    """Write HDF5 with variable-length datasets (no padding), and times centered at merger event (t=0)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     lengths = np.array([len(x) for x in sig_list], dtype=np.int32)
     delta_t = 1.0 / float(sampling_rate)
@@ -297,100 +293,29 @@ def finalize_and_write(
             f.create_dataset('psd', (len(full_psd_list),), dtype=vlen_f32, data=full_psd_list)
 
         # attrs
-        f.attrs['padding'] = padding_mode
+        f.attrs['padding'] = 'none'
         f.attrs['sampling_rate'] = float(sampling_rate)
         f.attrs['delta_t'] = float(delta_t)
-        f.attrs['time_axis'] = time_axis
+        f.attrs['time_axis'] = 'seconds-rel'  # t=0 at merger
         if attrs_extra:
             for k, v in attrs_extra.items():
                 f.attrs[k] = v
 
-    if padding_mode == 'none':
-        # Variable-length storage per sample
-        vlen_f32 = h5py.special_dtype(vlen=np.float32)
-        vlen_f64 = h5py.special_dtype(vlen=np.float64)
+    # variable-length storage per sample
+    vlen_f32 = h5py.special_dtype(vlen=np.float32)
+    vlen_f64 = h5py.special_dtype(vlen=np.float64)
 
-        # Build per-sample times according to time_axis
-        if time_axis == "index":
-            times_vlen = [np.arange(L, dtype=np.float64) for L in lengths]
-        elif time_axis == "seconds-rel":
-            # 0 at merger: subtract last valid time
-            times_vlen = [t - t[-1] for t in t_list]
-        elif time_axis == "seconds-abs":
-            times_vlen = t_list
-        else:
-            raise ValueError(f"Unknown time_axis: {time_axis}")
-
-        with h5py.File(output_path, 'w') as f:
-            f.create_dataset('signal', (len(sig_list),), dtype=vlen_f32, data=sig_list)
-            f.create_dataset('noise',  (len(noise_list),), dtype=vlen_f32, data=noise_list)
-            f.create_dataset('noisy',  (len(noisy_list),), dtype=vlen_f32, data=noisy_list)
-            f.create_dataset('times',  (len(times_vlen),), dtype=vlen_f64, data=times_vlen)
-            f.create_dataset('lengths', data=lengths)
-            _write_common(f)
-        print(f"saved {len(sig_list)} samples (padding=none) --> {output_path}")
-        return
-
-    # padded modes
-    if padding_mode == 'dataset_max':
-        target_len = int(lengths.max())
-        pad_attr_name, pad_attr_val = 'max_length', target_len
-    elif padding_mode == 'physical_max':
-        assert physical_len and physical_len > 0, "physical_len required for physical_max"
-        target_len = int(physical_len)
-        pad_attr_name, pad_attr_val = 'physical_length', target_len
-    else:
-        raise ValueError(f"unrecognised padding_mode: {padding_mode}")
-
-    # Build a single global base time vector (seconds from start index 0)
-    times_base = np.arange(target_len) * delta_t
-
-    N = len(sig_list)
-    signals = np.zeros((N, target_len), dtype=np.float32)
-    noises  = np.zeros_like(signals)
-    noisy   = np.zeros_like(signals)
-    mask    = np.zeros_like(signals)
-
-    for i, L in enumerate(lengths):
-        Lc = min(L, target_len)
-        signals[i, :Lc] = sig_list[i][:Lc]
-        noises[i,  :Lc] = noise_list[i][:Lc]
-        noisy[i,   :Lc] = noisy_list[i][:Lc]
-        mask[i,    :Lc] = 1.0
+    # always store seconds-relative time: t_rel = t - t[-1] (merger at 0)
+    times_vlen = [t - t[-1] for t in t_list]
 
     with h5py.File(output_path, 'w') as f:
-        chunk_len = min(16384, target_len)
-        dset_kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=(1, chunk_len))
-
-        f.create_dataset('signal', data=signals, **dset_kwargs)
-        f.create_dataset('noise',  data=noises,  **dset_kwargs)
-        f.create_dataset('noisy',  data=noisy,   **dset_kwargs)
-        f.create_dataset('mask',   data=mask,    **dset_kwargs)
+        f.create_dataset('signal', (len(sig_list),), dtype=vlen_f32, data=sig_list)
+        f.create_dataset('noise',  (len(noise_list),), dtype=vlen_f32, data=noise_list)
+        f.create_dataset('noisy',  (len(noisy_list),), dtype=vlen_f32, data=noisy_list)
+        f.create_dataset('times',  (len(times_vlen),), dtype=vlen_f64, data=times_vlen)
         f.create_dataset('lengths', data=lengths)
-
-        # collect the base time grid and any needed per-sample offsets
-        if time_axis == "index":
-            f.create_dataset('times', data=np.arange(target_len, dtype=np.float64))
-            f.attrs['times_interpretation'] = "index"
-        elif time_axis == "seconds-rel":
-            # store base seconds from index 0, plus a per-sample offset so last valid is 0
-            f.create_dataset('times', data=times_base.astype(np.float64))
-            t_rel0 = -(lengths.astype(np.int64) - 1) * delta_t
-            f.create_dataset('t_rel0', data=t_rel0.astype(np.float64))
-            f.attrs['times_interpretation'] = "seconds_rel_via_offset"
-            # reconstruct: t_rel(i,k) = times[k] + t_rel0[i]
-        elif time_axis == "seconds-abs":
-            # store base seconds from start; "absolute time = epoch[i] + times[k]"
-            f.create_dataset('times', data=times_base.astype(np.float64))
-            f.attrs['times_interpretation'] = "seconds_abs_via_epoch"
-            # reconstruct: t_abs(i,k) = epoch[i] + times[k]
-        else:
-            raise ValueError(f"Unknown time_axis: {time_axis}")
-
-        f.attrs[pad_attr_name] = pad_attr_val
         _write_common(f)
-
-    print(f"saved {N} samples (padding={padding_mode}, {pad_attr_name}={pad_attr_val}) --> {output_path}")
+    print(f"saved {len(sig_list)} samples (padding=none, time_axis=seconds-rel) --> {output_path}")
 
 
 if __name__ == "__main__":
@@ -409,8 +334,8 @@ if __name__ == "__main__":
             "  grid   : make an even grid over (m1, m2); balanced #samples per unordered pair (m2 <= m1)\n\n"
             "OUTPUT\n"
             "  HDF5 containing:\n"
-            "    - signal/noise/noisy arrays\n"
-            "    - times (variable-length mode) OR (times base + offsets) in padded modes\n"
+            "    - signal/noise/noisy arrays (variable-length)\n"
+            "    - times (seconds-relative, merger at t=0)\n"
             "    - metadata per sample (masses, spins, SNR, epoch, PSD metadata, etc.)\n"
         ),
         formatter_class=_HelpFmt,
@@ -459,17 +384,7 @@ if __name__ == "__main__":
     g_grid.add_argument('--require-complete-grid', action='store_true',
                         help='If set, raise an error if any (m1,m2) pair fails during the probe step (tip: try adjusting --f-lower).')
 
-    # PADDING
-    g_pad = parser.add_argument_group("Padding")
-    g_pad.add_argument('--padding', choices=['dataset_max', 'none', 'physical_max'], default='dataset_max',
-                       help=("Padding strategy:\n"
-                             "  none         : variable-length datasets (vlen)\n"
-                             "  dataset_max  : pad/truncate all to the max length observed in this run\n"
-                             "  physical_max : pad/truncate all to a reference physical length (see --phys-*)"))
-    g_pad.add_argument('--phys-m1', type=float, default=10.0, help='Reference mass1 for physical_max padding.')
-    g_pad.add_argument('--phys-m2', type=float, default=10.0, help='Reference mass2 for physical_max padding.')
-    g_pad.add_argument('--phys-s1', type=float, default=0.0, help='Reference spin1z for physical_max padding.')
-    g_pad.add_argument('--phys-s2', type=float, default=0.0, help='Reference spin2z for physical_max padding.')
+    # removed padding args --> now variable length and padding is performed in loader
 
     # MISC / TUNABLES
     g_misc = parser.add_argument_group("Misc")
@@ -493,14 +408,6 @@ if __name__ == "__main__":
     g_psd.add_argument('--psd-preview-dir', type=str, default=None,
                        help='Directory for PSD preview images; defaults to <output_dir>/psd_plots.')
 
-    # Time axis selection
-    g_time = parser.add_argument_group("Time axis")
-    g_time.add_argument('--time-axis', choices=['index', 'seconds-rel', 'seconds-abs'], default='index',
-                        help=("How to store the time axis:\n"
-                              "  index       : sample index (0..L-1)\n"
-                              "  seconds-rel : seconds with merger at t=0 (last valid sample)\n"
-                              "  seconds-abs : absolute seconds using per-sample 'epoch' (padded modes store base + epoch)\n"))
-
     args = parser.parse_args()
 
     args_json = json.dumps(vars(args), sort_keys=True)
@@ -511,7 +418,7 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
 
-    # Default PSD preview dir next to output
+    # default PSD preview dir next to output
     if args.psd_preview and not args.psd_preview_dir:
         base_dir = os.path.dirname(args.output_path)
         args.psd_preview_dir = os.path.join(base_dir, "psd_plots")
@@ -536,20 +443,10 @@ if __name__ == "__main__":
             use_tqdm=args.use_tqdm
         )
 
-        phys_len = None
-        if args.padding == 'physical_max':
-            phys_len = len(generate_ligo_waveform(
-                mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
-                spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
-                ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
-            )['signal'])
         finalize_and_write(
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
-            padding_mode=args.padding,
             sampling_rate=args.sampling_rate,
-            physical_len=phys_len,
             attrs_extra={
                 'mode': 'fixed',
                 'approximant': 'SEOBNRv4',
@@ -558,8 +455,7 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list,
-            time_axis=args.time_axis
+            full_psd_list=full_psd_list
         )
 
     elif args.mode == 'random':
@@ -610,21 +506,10 @@ if __name__ == "__main__":
             use_tqdm=args.use_tqdm
         )
 
-        phys_len = None
-        if args.padding == 'physical_max':
-            phys_len = len(generate_ligo_waveform(
-                mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
-                spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
-                ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
-            )['signal'])
-
         finalize_and_write(
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
-            padding_mode=args.padding,
             sampling_rate=args.sampling_rate,
-            physical_len=phys_len,
             attrs_extra={
                 'mode': 'random',
                 'approximant': 'SEOBNRv4',
@@ -633,8 +518,7 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list,
-            time_axis=args.time_axis
+            full_psd_list=full_psd_list
         )
 
     elif args.mode == 'grid':
@@ -780,21 +664,10 @@ if __name__ == "__main__":
             print(f"[WARNING] only generated {succ}/{args.num_samples} after filtering failures. "
                   f"Try adjusting --overgen-factor or re-running.")
 
-        phys_len = None
-        if args.padding == 'physical_max':
-            phys_len = len(generate_ligo_waveform(
-                mass1=args.phys_m1, mass2=args.phys_m2, target_snr=10.0,
-                spin1z=args.phys_s1, spin2z=args.phys_s2, distance=410.0,
-                f_lower=args.f_lower, sampling_rate=args.sampling_rate, detector="H1",
-                ra=0.0, dec=0.0, polarization=0.0, random_seed=0, plot=False
-            )['signal'])
-
         finalize_and_write(
             output_path=args.output_path,
             sig_list=sig_list, noise_list=noise_list, noisy_list=noisy_list, t_list=t_list, meta=meta,
-            padding_mode=args.padding,
             sampling_rate=args.sampling_rate,
-            physical_len=phys_len,
             attrs_extra={
                 'mode': 'grid',
                 'grid_steps': int(n),
@@ -812,6 +685,5 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list,
-            time_axis=args.time_axis
+            full_psd_list=full_psd_list
         )
