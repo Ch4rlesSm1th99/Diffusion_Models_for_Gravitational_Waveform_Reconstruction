@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from models import UNet1D, CustomDiffusion
+from dataloader import make_dataloader, NoisyWaveDataset
 
 
 def prepare_output_dir(base_dir: str) -> str:
@@ -42,54 +43,13 @@ class CleanWaveDataset(Dataset):
         except Exception:
             pass
 
-class NoisyWaveDataset(Dataset):
-    def __init__(self, h5_path: str):
-        self.h5_path = h5_path
-        self.h5 = None
-        self.noisy = None
-        self.mask = None
-
-    def _ensure_open(self):
-        if self.h5 is None:
-            self.h5 = h5py.File(self.h5_path, 'r', swmr=True)  # read-only
-            self.noisy = self.h5['noisy']
-            self.mask  = self.h5.get('mask', None)
-
-    def __len__(self):
-        if self.noisy is not None:
-            return self.noisy.shape[0]
-        with h5py.File(self.h5_path, 'r') as f:
-            return f['noisy'].shape[0]
-
-    def __getitem__(self, idx):
-        self._ensure_open()
-        noisy = torch.from_numpy(self.noisy[idx]).unsqueeze(0).float()
-        if self.mask is not None:
-            mask = torch.from_numpy(self.mask[idx].astype(np.float32)).unsqueeze(0)
-            valid = noisy[mask.bool()]
-            sigma = valid.std() if valid.numel() > 0 else torch.tensor(1.0)
-        else:
-            mask = torch.ones_like(noisy)
-            s = noisy.std()
-            sigma = s if s > 0 else torch.tensor(1.0)
-        noisy_norm = noisy / sigma
-        return noisy_norm, sigma, mask
-
-    def __del__(self):
-        try:
-            if self.h5 is not None:
-                self.h5.close()
-        except:
-            pass
-
-
-
 
 def train_diffusion(args):
     out_dir = prepare_output_dir(args.model_dir)
 
     ds = NoisyWaveDataset(args.data)
-    loader = DataLoader(ds,batch_size=args.batch_size,shuffle=True,num_workers=4, pin_memory=True,persistent_workers=True,prefetch_factor=2)
+    loader = make_dataloader(
+        h5_path=args.data, batch_size=args.batch_size, shuffle=True, num_workers=4, prefetch_factor=2, persistent_workers=True, pin_memory=True,)
 
     device = torch.device(args.device)
     model = UNet1D(in_ch=1, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
