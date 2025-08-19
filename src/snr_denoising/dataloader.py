@@ -1,4 +1,16 @@
-# dataloader.py
+import os
+import h5py
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from typing import Tuple, Optional, List
+
+DEFAULT_DATA_DIR = (
+    "/mnt/c/Users/charl/PycharmProjects/"
+    "Diffusion_Models_for_Gravitational_Waveform_Reconstruction/data/latest_data"
+)
+
 """
 Dataloader utilities for LIGO GW diffusion training with padding.
 
@@ -15,19 +27,6 @@ Exports:
 - pad_collate
 - make_dataloader(...)
 """
-
-import os
-import h5py
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional, List
-
-DEFAULT_DATA_DIR = (
-    "/mnt/c/Users/charl/PycharmProjects/"
-    "Diffusion_Models_for_Gravitational_Waveform_Reconstruction/data/latest_data"
-)
 
 def resolve_h5_path(path: str) -> str:
     """
