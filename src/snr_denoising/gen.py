@@ -19,11 +19,11 @@ Modes:
   - grid  : balanced coverage of (m1, m2) pairs in a grid (unordered: m2 <= m1)
 
 Output:
-  HDF5 containing variable-length signal/noise/noisy, per-sample times (seconds-relative with t=0 at merger),
-  metadata and gen mode.
+  HDF5 containing variable-length signal/noise/noisy, per-sample times
+  (seconds-relative with t=0 at merger), metadata and gen mode.
 
 This version has **no fallbacks**. If a combo fails (e.g., SEOBNRv4 at given f_lower), it is skipped — or,
-with --require-complete-grid, the run aborts and tells you to adjust --f-lower (or ranges).
+with --require-complete-grid, the run aborts and tells user to adjust --f-lower (or ranges).
 """
 
 try:
@@ -83,7 +83,7 @@ def generate_ligo_waveform(
         psd = aLIGOZeroDetHighPower(len(signal)//2 + 1, df, f_lower)
         _PSD_CACHE[psd_key] = psd
 
-    # Scale to target SNR (noise-weighted)
+    # Scale to target SNR
     current_snr = sigma(signal, psd=psd, low_frequency_cutoff=f_lower)
     scaled_signal = signal * (target_snr / current_snr)
 
@@ -148,7 +148,7 @@ def collect_samples(
     Generate samples from a list of specs (kwargs for generate_ligo_waveform).
     Enforces m1 >= m2 for generation safety (labels may be unsorted if in args).
 
-    Each spec must contain at least: mass1, mass2, target_snr, spin1z, spin2z
+    Each sample must contain at least: mass1, mass2, target_snr, spin1z, spin2z
     """
     os.makedirs(psd_preview_dir, exist_ok=True) if (psd_preview and psd_preview_dir) else None
 
@@ -225,12 +225,10 @@ def collect_samples(
         meta['psd_f_lower'].append(f_lower)
         detectors.append(detector.encode('utf-8'))
 
-        # Optional full PSD vector
         if full_psd_list is not None:
             psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy().astype(np.float32)
             full_psd_list.append(psd_vec)
 
-        # Optional PSD previews
         if psd_preview and (len(sig_list) <= psd_preview) and psd_preview_dir:
             psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy()
             f = np.arange(psd_vec.shape[0]) * df
@@ -274,7 +272,7 @@ def finalize_and_write(
     detectors_bytes=None,
     full_psd_list=None
 ):
-    """Write HDF5 with variable-length datasets (no padding), and times centered at merger event (t=0)."""
+    """Write HDF5 with variable-length datasets (no padding now), and times centered at merger event (t=0)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     lengths = np.array([len(x) for x in sig_list], dtype=np.int32)
     delta_t = 1.0 / float(sampling_rate)
@@ -296,7 +294,7 @@ def finalize_and_write(
         f.attrs['padding'] = 'none'
         f.attrs['sampling_rate'] = float(sampling_rate)
         f.attrs['delta_t'] = float(delta_t)
-        f.attrs['time_axis'] = 'seconds-rel'  # t=0 at merger
+        f.attrs['time_axis'] = 'seconds-rel-peak'  # t=0 at merger event
         if attrs_extra:
             for k, v in attrs_extra.items():
                 f.attrs[k] = v
@@ -305,17 +303,29 @@ def finalize_and_write(
     vlen_f32 = h5py.special_dtype(vlen=np.float32)
     vlen_f64 = h5py.special_dtype(vlen=np.float64)
 
-    # always store seconds-relative time: t_rel = t - t[-1] (merger at 0)
-    times_vlen = [t - t[-1] for t in t_list]
+    # center each sample at the merger t_rel = t_abs - t_peak_abs
+    times_vlen = []
+    t_mergers = []
+    for sig_np, t_abs in zip(sig_list, t_list):
+        # if signal is all zeros, fall back to last sample
+        if np.max(np.abs(sig_np)) > 0:
+            pk = int(np.argmax(np.abs(sig_np)))
+        else:
+            pk = len(sig_np) - 1
+        t0 = float(t_abs[pk])  # absolute time at peak
+        t_rel = (t_abs - t0).astype(np.float64)
+        times_vlen.append(t_rel)
+        t_mergers.append(t0)
 
     with h5py.File(output_path, 'w') as f:
         f.create_dataset('signal', (len(sig_list),), dtype=vlen_f32, data=sig_list)
         f.create_dataset('noise',  (len(noise_list),), dtype=vlen_f32, data=noise_list)
         f.create_dataset('noisy',  (len(noisy_list),), dtype=vlen_f32, data=noisy_list)
         f.create_dataset('times',  (len(times_vlen),), dtype=vlen_f64, data=times_vlen)
+        f.create_dataset('t_merger', data=np.array(t_mergers, dtype=np.float64))
         f.create_dataset('lengths', data=lengths)
         _write_common(f)
-    print(f"saved {len(sig_list)} samples (padding=none, time_axis=seconds-rel) --> {output_path}")
+    print(f"saved {len(sig_list)} samples (padding=none, time_axis=seconds-rel-peak; t=0 at |signal| peak) --> {output_path}")
 
 
 if __name__ == "__main__":
@@ -335,7 +345,7 @@ if __name__ == "__main__":
             "OUTPUT\n"
             "  HDF5 containing:\n"
             "    - signal/noise/noisy arrays (variable-length)\n"
-            "    - times (seconds-relative, merger at t=0)\n"
+            "    - times (seconds-relative, merger at t=0 via |signal| peak)\n"
             "    - metadata per sample (masses, spins, SNR, epoch, PSD metadata, etc.)\n"
         ),
         formatter_class=_HelpFmt,
@@ -384,7 +394,6 @@ if __name__ == "__main__":
     g_grid.add_argument('--require-complete-grid', action='store_true',
                         help='If set, raise an error if any (m1,m2) pair fails during the probe step (tip: try adjusting --f-lower).')
 
-    # removed padding args --> now variable length and padding is performed in loader
 
     # MISC / TUNABLES
     g_misc = parser.add_argument_group("Misc")
