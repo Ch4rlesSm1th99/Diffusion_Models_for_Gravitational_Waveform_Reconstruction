@@ -225,7 +225,7 @@ def compute_mae_per_combo(ds: InferenceDataset, model, diffusion, t_pick: int, d
             # one-step reconstruction
             x0_hat_raw = one_step_recon(model, diffusion, clean_norm, sigma, t_pick)
 
-            # MAE over the 1D waveform; then aggregate over samples
+            # MAE over the 1D waveform
             err = torch.mean(torch.abs(x0_hat_raw - clean_raw)).item()
             maes.append(err)
 
@@ -234,7 +234,6 @@ def compute_mae_per_combo(ds: InferenceDataset, model, diffusion, t_pick: int, d
         print(f"[metric] combo {combo_idx+1}/{len(groups)} {combo}: "
               f"n={len(maes)}, MAE={combo_stats[combo]['mae']:.6e}")
 
-    # write CSV mapping
     csv_path = os.path.join(outdir, "combo_mae.csv")
     with open(csv_path, "w") as fh:
         fh.write("index,m1,m2,count,mae\n")
@@ -351,7 +350,7 @@ def main():
 
     diffusion = CustomDiffusion(T=ckpt["args"]["T"], device=device)
     t_pick, snr_at_t = t_for_target_snr(diffusion, args.target_snr)
-    print(f"[info] target SNR={args.target_snr:.1f} → t={t_pick} (actual SNR≈{snr_at_t:.2f})")
+    print(f"[info] target SNR={args.target_snr:.1f} --> t={t_pick} (actual SNR≈{snr_at_t:.2f})")
 
     # dataset
     ds = InferenceDataset(args.data)
@@ -381,7 +380,7 @@ def main():
         tag_combo = f"m1_{m1}_m2_{m2}" if not isinstance(m1, str) else "all"
 
         pick_idxs = even_pick(idx_list, args.examples_per_combo)
-        print(f"[combo {combo_idx+1}/{len(groups)}] {tag_combo}: {len(idx_list)} samples → plotting {len(pick_idxs)}")
+        print(f"[combo {combo_idx+1}/{len(groups)}] {tag_combo}: {len(idx_list)} samples --> plotting {len(pick_idxs)}")
 
         out_dir_combo = os.path.join(args.outdir, tag_combo)
         os.makedirs(out_dir_combo, exist_ok=True)
