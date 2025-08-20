@@ -323,7 +323,7 @@ def main():
     ap.add_argument("--tight", action="store_true")
     ap.add_argument("--unordered-pairs", action="store_true")
 
-    # NEW: metric / matrix
+    # metric + matrix args
     ap.add_argument("--mass-combo-matrix", action="store_true",
                     help="If set, compute MAE per mass combo and save a mass-grid heatmap instead of overlays.")
     ap.add_argument("--matrix-ext", type=str, default="png", choices=["png", "pdf"],
