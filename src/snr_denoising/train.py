@@ -9,7 +9,6 @@ from tqdm import tqdm
 from models import UNet1D, CustomDiffusion
 from dataloader import make_dataloader, NoisyWaveDataset
 
-
 def prepare_output_dir(base_dir: str) -> str:
     out_dir = os.path.join(base_dir, 'latest_model')
     if os.path.exists(out_dir):
@@ -20,39 +19,22 @@ def prepare_output_dir(base_dir: str) -> str:
     return out_dir
 
 
-class CleanWaveDataset(Dataset):
-    def __init__(self, h5_path: str):
-        self.h5 = h5py.File(h5_path, 'r')
-        self.signals = self.h5['signal']
-
-    def __len__(self):
-        return self.signals.shape[0]
-
-    def __getitem__(self, idx):
-        clean_np = self.signals[idx]
-        clean = torch.from_numpy(clean_np).unsqueeze(0).float()
-        sigma = clean.std()
-        if sigma == 0:      # normalise + avoid divide by zero error (dont add small numebr)
-            sigma = torch.tensor(1.0)
-        clean_norm = clean / sigma
-        return clean_norm, sigma
-
-    def __del__(self):
-        try:
-            self.h5.close()
-        except Exception:
-            pass
-
-
 def train_diffusion(args):
     out_dir = prepare_output_dir(args.model_dir)
 
-    ds = NoisyWaveDataset(args.data)
+    # loader yields: clean_raw, noisy_raw, sigma, mask
     loader = make_dataloader(
-        h5_path=args.data, batch_size=args.batch_size, shuffle=True, num_workers=4, prefetch_factor=2, persistent_workers=True, pin_memory=True,)
+        h5_path=args.data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        prefetch_factor=2,
+        persistent_workers=True,
+        pin_memory=True,
+    )
 
     device = torch.device(args.device)
-    model = UNet1D(in_ch=1, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
+    model = UNet1D(in_ch=2, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
     diffusion = CustomDiffusion(T=args.T, device=device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
@@ -60,62 +42,30 @@ def train_diffusion(args):
         model.train()
         total_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for i, (noisy_norm, sigma, mask) in enumerate(pbar):
-            noisy_norm = noisy_norm.to(device)
-            sigma = sigma.to(device)
-            mask = mask.to(device)
-            bsz = noisy_norm.size(0)
+
+        for i, (clean_raw, noisy_raw, sigma, mask) in enumerate(pbar):
+            clean_raw = clean_raw.to(device).float()
+            noisy_raw = noisy_raw.to(device).float()
+            sigma     = sigma.to(device)
+            mask      = mask.to(device).float()
+            bsz = clean_raw.size(0)
+
+            sigma_ = sigma.view(-1, 1, 1)
+            clean_norm = clean_raw / sigma_
+            cond_norm  = noisy_raw / sigma_
 
             t = torch.randint(0, args.T, (bsz,), device=device)
-            xt, noise = diffusion.q_sample(noisy_norm, t)
-            pred_noise = model(xt, t)
+            x_t, eps = diffusion.q_sample(clean_norm, t)
 
-            # training diagnostics
-            if i == 0:
-                print("model device:", next(model.parameters()).device)
-                print("batch device:", noisy_norm.device, sigma.device, mask.device)
-                print("current cuda:", torch.cuda.current_device() if torch.cuda.is_available() else None)
-                def _stats(x):
-                    return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
-
-                nn_min, nn_max, nn_mean, nn_std = _stats(noisy_norm)           # input singal to forward diffusion stat
-                noise_min, noise_max, noise_mean, noise_std = _stats(noise)         # ground truth epsilon stat
-                xt_min, xt_max, xt_mean, xt_std = _stats(xt)       # noised signal at timestep t after forward process stat
-                p_min, p_max, p_mean, p_std = _stats(pred_noise)           # pred of epsilon stat
-
-                recon_norm = xt - pred_noise        # reconstruct normalised signal
-                r_min, r_max, r_mean, r_std = _stats(recon_norm)    # trend check
-
-                recon_unnorm = recon_norm * sigma.view(-1, 1, 1)        # un-normalize
-                ru_min, ru_max, ru_mean, ru_std = _stats(recon_unnorm)
-
-                print(f"[DEBUG] noisy_norm:  min={nn_min:.3e}, max={nn_max:.3e}, mean={nn_mean:.3e}, std={nn_std:.3e}")
-                print(
-                    f"[DEBUG] noise:        min={noise_min:.3e}, max={noise_max:.3e}, mean={noise_mean:.3e}, std={noise_std:.3e}")
-                print(f"[DEBUG] xt:           min={xt_min:.3e}, max={xt_max:.3e}, mean={xt_mean:.3e}, std={xt_std:.3e}")
-                print(f"[DEBUG] pred_noise:   min={p_min:.3e}, max={p_max:.3e}, mean={p_mean:.3e}, std={p_std:.3e}")
-                print(f"[DEBUG] recon_norm:   min={r_min:.3e}, max={r_max:.3e}, mean={r_mean:.3e}, std={r_std:.3e}")
-                print(
-                    f"[DEBUG] recon_unnorm: min={ru_min:.3e}, max={ru_max:.3e}, mean={ru_mean:.3e}, std={ru_std:.3e}\n")
+            net_in = torch.cat([x_t, cond_norm], dim=1)
+            eps_hat = model(net_in, t)
 
 
-                recon_mse_norm = torch.nn.functional.mse_loss(recon_norm, noisy_norm)
-                print(f"[CHECK] Epoch {epoch} recon MSE (norm): {recon_mse_norm:.3e}")  # MSE on recon norm
+            mse = (eps_hat - eps) ** 2
+            denom = mask.sum(dim=[1, 2]).clamp_min(1.0)    # unpadded points per sample
+            loss = (mse * mask).sum(dim=[1, 2]) / denom
+            loss = loss.mean()
 
-                noisy_flat = noisy_norm.view(bsz, -1)
-                recon_flat = recon_norm.view(bsz, -1)
-                cos_sim_norm = torch.nn.functional.cosine_similarity(noisy_flat, recon_flat, dim=1).mean()
-                print(f"[CHECK] Epoch {epoch} cos-sim (norm): {cos_sim_norm:.3f}")      # cosine simaliry on norm
-
-                true_noise_norm = xt - noisy_norm
-                res_noise_norm = true_noise_norm - pred_noise
-                snr_imp_norm = true_noise_norm.std() / res_noise_norm.std()
-                print(f"[CHECK] Epoch {epoch} SNR improvement (norm): {snr_imp_norm:.2f}x") # SNR improvement
-
-            mse = (pred_noise - noise) ** 2
-            denom = mask.sum(dim=[1, 2]).clamp_min(1.0)  # unpadded points per sample
-            loss = (mse * mask).sum(dim=[1, 2]) / denom  # masked MSE
-            loss = loss.mean()  # average over batch
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -123,23 +73,44 @@ def train_diffusion(args):
             total_loss += loss.item() * bsz
             pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-        avg_loss = total_loss / len(ds)
+            if i == 0:
+                def _stats(x):
+                    return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
+
+                ct_min, ct_max, ct_mean, ct_std = _stats(x_t)
+                cn_min, cn_max, cn_mean, cn_std = _stats(clean_norm)
+                yn_min, yn_max, yn_mean, yn_std = _stats(cond_norm)
+                eh_min, eh_max, eh_mean, eh_std = _stats(eps_hat)
+                print(f"[DEBUG] clean_norm: min={cn_min:.3e}, max={cn_max:.3e}, mean={cn_mean:.3e}, std={cn_std:.3e}")
+                print(f"[DEBUG] cond_norm:  min={yn_min:.3e}, max={yn_max:.3e}, mean={yn_mean:.3e}, std={yn_std:.3e}")
+                print(f"[DEBUG] x_t:        min={ct_min:.3e}, max={ct_max:.3e}, mean={ct_mean:.3e}, std={ct_std:.3e}")
+                print(f"[DEBUG] eps_hat:    min={eh_min:.3e}, max={eh_max:.3e}, mean={eh_mean:.3e}, std={eh_std:.3e}")
+
+                # x0_hat_norm = (x_t - sqrt(1 - alpha_bar[t])*eps_hat) / sqrt(alpha_bar[t])
+                ab = diffusion.alpha_bar[t].view(-1, 1, 1)        # [B,1,1]
+                x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
+                x0_hat = x0_hat_norm * sigma_
+
+                x0_min, x0_max, x0_mean, x0_std = _stats(x0_hat)
+                print(f"[DEBUG] recon_unnorm: min={x0_min:.3e}, max={x0_max:.3e}, mean={x0_mean:.3e}, std={x0_std:.3e}")
+
+        avg_loss = total_loss / sum(len for _, _, _, len in loader.dataset) if hasattr(loader, 'dataset') else total_loss
         print(f"Epoch {epoch}/{args.epochs} - Average Loss: {avg_loss:.6f}")
 
     save_path = os.path.join(out_dir, 'model_diffusion.pth')
     torch.save({
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
-        'args': vars(args),
+        'args': {**vars(args), 'conditional': True, 'in_ch': 2, 'conditioning': 'concat_noisy'},
         'epoch': args.epochs,
     }, save_path)
     print(f"Saved model to {save_path}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train diffusion model on LIGO waveforms")
+    parser = argparse.ArgumentParser(description="Train conditional diffusion denoiser on LIGO waveforms")
     parser.add_argument('--data',       type=str, required=True,
-                        help='Path to HDF5 file with "signal" dataset')
+                        help='Path to HDF5 with "signal" and "noisy" datasets (variable-length)')
     parser.add_argument('--model_dir',  type=str, default='model',
                         help='Base directory to create latest_model')
     parser.add_argument('--epochs',     type=int,   default=50,
