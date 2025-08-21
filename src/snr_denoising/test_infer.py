@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 import h5py
 import numpy as np
@@ -8,6 +9,11 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 from models import UNet1D, CustomDiffusion
 
+
+def _slugify_title(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
 
 class InferenceDataset(Dataset):
     """
@@ -36,7 +42,7 @@ class InferenceDataset(Dataset):
 
     def _times_rel(self, idx: int, L: int) -> np.ndarray:
         """
-        Return seconds-relative time with t=0 at the local merger at (max signal).
+        Return seconds-relative time with t=0 at the local merger (max |signal|).
         Uses stored 'times' if available, but re-centers on the peak unless the file
         explicitly says it already.
         """
@@ -101,6 +107,7 @@ class InferenceDataset(Dataset):
         self.close()
 
 
+
 def snr_from_alpha_bar(alpha_bar: torch.Tensor) -> np.ndarray:
     """SNR(t) = sqrt(alpha_bar / (1 - alpha_bar))"""
     ab = alpha_bar.detach().cpu().numpy()
@@ -124,6 +131,8 @@ def one_step_recon(model, diffusion, clean_norm: torch.Tensor, sigma: torch.Tens
     ab = diffusion.alpha_bar[t_scalar]
     x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
     return x0_hat_norm * sigma.view(-1, 1, 1)
+
+
 
 def even_pick(indices: list, k: int) -> list:
     """Pick up to k indices evenly spaced from a list, preserving order."""
@@ -152,8 +161,6 @@ def group_indices_by_mass(h5_path: str, unordered: bool = False):
         groups.setdefault(key, []).append(int(i))
     return groups
 
-
-
 def plot_overlaid(
     tag: str,
     t_1d: np.ndarray,
@@ -162,6 +169,8 @@ def plot_overlaid(
     clean_1d: np.ndarray,
     out_dir: str,
     title: str = "",
+    global_title: str = "",
+    filename_suffix: str = "",
     ext: str = "pdf",
     dpi: int = 150,
     lw_noisy: float = 1.0,
@@ -191,7 +200,12 @@ def plot_overlaid(
         if plot_type in ("all", "clean_recon"):
             plt.plot(t_1d, clean_1d, label="Clean", alpha=1.0, linewidth=lw_clean)
 
-        if title: plt.title(title)
+        full_title = title
+        if global_title:
+            full_title = f"{global_title} — {title}" if title else global_title
+        if full_title:
+            plt.title(full_title)
+
         plt.xlabel("Time (s) — merger at t=0")
         plt.ylabel("Strain")
         plt.legend(frameon=False)
@@ -201,8 +215,10 @@ def plot_overlaid(
         save_kwargs = {"dpi": dpi}
         if tight:
             save_kwargs.update({"bbox_inches": "tight", "pad_inches": 0.02})
-        plt.savefig(os.path.join(out_dir, f"{tag}.{ext}"), **save_kwargs)
+        suffix = f"_{filename_suffix}" if filename_suffix else ""
+        plt.savefig(os.path.join(out_dir, f"{tag}{suffix}.{ext}"), **save_kwargs)
         plt.close()
+
 
 
 @torch.no_grad()
@@ -244,61 +260,105 @@ def compute_mae_per_combo(ds: InferenceDataset, model, diffusion, t_pick: int, d
 
     return combo_stats
 
-def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi: int = 150, tight: bool = True):
+def _axes_from_h5(h5_path: str):
+    """
+    Build expected unique m1 and m2 axes (sorted) from the file labels.
+    Returns (m1_vals, m2_vals) or (None, None) if labels are missing.
+    """
+    with h5py.File(h5_path, "r") as f:
+        if "label_m1" in f and "label_m2" in f:
+            m1_vals = sorted(set(np.array(f["label_m1"]).astype(float).tolist()))
+            m2_vals = sorted(set(np.array(f["label_m2"]).astype(float).tolist()))
+            return m1_vals, m2_vals
+        if "mass1" in f and "mass2" in f:
+            m1_vals = sorted(set(np.array(f["mass1"]).astype(float).tolist()))
+            m2_vals = sorted(set(np.array(f["mass2"]).astype(float).tolist()))
+            return m1_vals, m2_vals
+    return None, None
+
+
+def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi: int = 150, tight: bool = True,
+                           m1_axis_expected=None, m2_axis_expected=None, title: str = "", filename_suffix: str = ""):
+    """
+    Build a grid with:
+      rows  = sorted unique m1 values (use expected axes if provided)
+      cols  = sorted unique m2 values (use expected axes if provided)
+      cell(m1, m2) = MAE for that combo if it exists (typically only for m2 <= m1).
+    Missing combos remain NaN (shown blank). Writes mapping CSV + missing_pairs.csv.
+    """
     combos = list(combo_stats.keys())
     if not combos:
         print("[metric] No combos to plot.")
         return
 
-    m1_vals = sorted({m1 for (m1, m2) in combos})       # build axis from combos
-    m2_vals = sorted({m2 for (m1, m2) in combos})
+    # Axes: rows=m1, cols=m2
+    if m1_axis_expected is not None and m2_axis_expected is not None:
+        m1_vals = list(m1_axis_expected)  # rows
+        m2_vals = list(m2_axis_expected)  # cols
+    else:
+        m1_vals = sorted({m1 for (m1, m2) in combos})
+        m2_vals = sorted({m2 for (m1, m2) in combos})
 
-    m1_to_col = {v: i for i, v in enumerate(m1_vals)}
-    m2_to_row = {v: i for i, v in enumerate(m2_vals)}
+    m1_to_row = {v: i for i, v in enumerate(m1_vals)}
+    m2_to_col = {v: i for i, v in enumerate(m2_vals)}
 
-    grid = np.full((len(m2_vals), len(m1_vals)), np.nan, dtype=np.float64)
+    grid = np.full((len(m1_vals), len(m2_vals)), np.nan, dtype=np.float64)
 
     for (m1, m2), stats in combo_stats.items():
-        r = m2_to_row[m2]
-        c = m1_to_col[m1]
+        if (m1 not in m1_to_row) or (m2 not in m2_to_col):
+            continue
+        r = m1_to_row[m1]
+        c = m2_to_col[m2]
         grid[r, c] = stats["mae"]
 
     map_csv = os.path.join(outdir, "matrix_index_map.csv")
     with open(map_csv, "w") as fh:
         fh.write("axis,index,mass\n")
-        for i, v in enumerate(m1_vals):
-            fh.write(f"x,{i},{v}\n")
         for i, v in enumerate(m2_vals):
+            fh.write(f"x,{i},{v}\n")
+        for i, v in enumerate(m1_vals):
             fh.write(f"y,{i},{v}\n")
     print(f"[metric] wrote: {map_csv}")
 
-    masked = np.ma.masked_invalid(grid)     # plot heatmap with NaNs masked
+    expected = {(m1, m2) for m1 in m1_vals for m2 in m2_vals if m2 <= m1}
+    present  = set(combo_stats.keys())
+    missing  = sorted(list(expected - present), key=lambda t: (t[0], t[1]))
+    miss_csv = os.path.join(outdir, "missing_pairs.csv")
+    with open(miss_csv, "w") as fh:
+        fh.write("m1,m2\n")
+        for (m1, m2) in missing:
+            fh.write(f"{m1},{m2}\n")
+    print(f"[metric] wrote: {miss_csv}  (missing={len(missing)})")
+
+    masked = np.ma.masked_invalid(grid)     # plot heatmap (mask NaNs)
     cmap = plt.cm.viridis
     cmap.set_bad(color='white')
 
-    fig_w = min(20, max(6, 0.45 * len(m1_vals) + 3))
-    fig_h = min(20, max(6, 0.45 * len(m2_vals) + 3))
+    fig_w = min(20, max(6, 0.45 * len(m2_vals) + 3))
+    fig_h = min(20, max(6, 0.45 * len(m1_vals) + 3))
 
     plt.figure(figsize=(fig_w, fig_h))
     im = plt.imshow(masked, interpolation="nearest", aspect="auto", cmap=cmap)
     cbar = plt.colorbar(im)
     cbar.set_label("MAE (|recon - clean|)")
 
-    plt.title("Mean Absolute Error by Mass Combo")
-    plt.xlabel("m1")
-    plt.ylabel("m2")
+    plt.title(title if title else "Mean Absolute Error by Mass Combo (rows=m1, cols=m2)")
+    plt.xlabel("m2")
+    plt.ylabel("m1")
 
-    plt.xticks(range(len(m1_vals)), [str(v) for v in m1_vals], rotation=45, ha="right")
-    plt.yticks(range(len(m2_vals)), [str(v) for v in m2_vals])
+    plt.xticks(range(len(m2_vals)), [str(v) for v in m2_vals], rotation=45, ha="right")
+    plt.yticks(range(len(m1_vals)), [str(v) for v in m1_vals])
 
     os.makedirs(outdir, exist_ok=True)
     save_kwargs = {"dpi": dpi}
     if tight:
         save_kwargs.update({"bbox_inches": "tight", "pad_inches": 0.02})
-    out_path = os.path.join(outdir, f"mae_mass_grid.{ext}")
+    suffix = f"_{filename_suffix}" if filename_suffix else ""
+    out_path = os.path.join(outdir, f"mae_mass_grid{suffix}.{ext}")
     plt.savefig(out_path, **save_kwargs)
     plt.close()
     print(f"[metric] wrote: {out_path}")
+
 
 
 def main():
@@ -322,6 +382,9 @@ def main():
     ap.add_argument("--tight", action="store_true")
     ap.add_argument("--unordered-pairs", action="store_true")
 
+    # titles
+    ap.add_argument("--title", type=str, default="", help="Optional plot title (also appended to filenames).")
+
     # metric + matrix args
     ap.add_argument("--mass-combo-matrix", action="store_true",
                     help="If set, compute MAE per mass combo and save a mass-grid heatmap instead of overlays.")
@@ -330,6 +393,7 @@ def main():
 
     args = ap.parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    title_slug = _slugify_title(args.title)
     print(f"[info] device = {device}")
 
     # mass groups (pass unordered=True if (m1,m2) normalized to (min,max))
@@ -364,11 +428,26 @@ def main():
             ds=ds, model=model, diffusion=diffusion, t_pick=t_pick,
             device=device, groups=groups, outdir=out_metrics
         )
-        save_mass_grid_heatmap(combo_stats, outdir=out_metrics, ext=args.matrix_ext, dpi=args.dpi, tight=True)
+
+
+        m1_axis, m2_axis = _axes_from_h5(args.data)
+
+        save_mass_grid_heatmap(
+            combo_stats,
+            outdir=out_metrics,
+            ext=args.matrix_ext,
+            dpi=args.dpi,
+            tight=True,
+            m1_axis_expected=m1_axis,
+            m2_axis_expected=m2_axis,
+            title=args.title,
+            filename_suffix=title_slug,
+        )
         ds.close()
         print(f"[complete] metrics written under: {out_metrics}")
         return
 
+    # plotting path
     def sort_key(key):
         m1, m2 = key
         if isinstance(m1, str):
@@ -400,8 +479,8 @@ def main():
             noisy_1d = noisy_raw[0].detach().cpu().numpy().ravel()
             recon_1d = x0_hat_raw[0].detach().cpu().numpy().ravel()
 
-            title = f"(m1={m1}, m2={m2})  idx={idx}  t={t_pick}  SNR≈{snr_at_t:.1f}"
-            tag   = f"{tag_combo}_ex{j}_idx{idx}"
+            local_title = f"(m1={m1}, m2={m2})  idx={idx}  t={t_pick}  SNR≈{snr_at_t:.1f}"
+            tag         = f"{tag_combo}_ex{j}_idx{idx}"
 
             plot_overlaid(
                 tag=tag,
@@ -410,7 +489,9 @@ def main():
                 recon_1d=recon_1d,
                 clean_1d=clean_1d,
                 out_dir=out_dir_combo,
-                title=title,
+                title=local_title,
+                global_title=args.title,
+                filename_suffix=title_slug,
                 ext=args.ext,
                 dpi=args.dpi,
                 plot_type=args.plot_type,
