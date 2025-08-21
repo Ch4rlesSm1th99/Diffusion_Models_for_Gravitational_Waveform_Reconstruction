@@ -16,7 +16,8 @@ Dataloader utilities for LIGO GW diffusion training with padding.
 
 Key points:
 - Read variable-length HDF5 (no padding in the file).
-- Per-sample normalisation: sigma = std(noisy).
+- Needs BOTH 'signal' (clean) and 'noisy' (PSD detector measurement).
+- Per-sample normalisation scale: sigma = std(noisy).
 - Batch-time padding in collate_fn:
     * Left-pad with zeros so the final index is the merger (t=0).
     * Build a 1/0 mask with ones over valid (unpadded) samples.
@@ -46,45 +47,38 @@ def resolve_h5_path(path: str) -> str:
 
 
 class NoisyWaveDataset(Dataset):
-    """
-    Dataset object for training on 'noisy' (signal + PSD noise).
-
-    Expects an HDF5 with vlen datasets written by the new gen.py:
-      - required: 'noisy'
-      - optional: none (mask is created in the collate step)
-
-    Returns (per sample):
-      noisy_norm: torch.FloatTensor [1, L]
-      sigma     : torch.FloatTensor []   (scalar)
-      length    : int                    (for collate to build masks/padding)
-    """
     def __init__(self, h5_path: str):
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
+        self._signal = None
         self._noisy = None
 
     def _ensure_open(self):
         if self.h5 is None:
             self.h5 = h5py.File(self.h5_path, "r", swmr=True)
-            self._noisy = self.h5["noisy"]
+            if "signal" not in self.h5 or "noisy" not in self.h5:
+                raise KeyError("HDF5 must contain both 'signal' and 'noisy' datasets.")
+            self._signal = self.h5["signal"]
+            self._noisy  = self.h5["noisy"]
 
     def __len__(self) -> int:
         with h5py.File(self.h5_path, "r") as f:
-            return f["noisy"].shape[0]
+            return f["signal"].shape[0]
 
     def __getitem__(self, idx: int):
         self._ensure_open()
+        clean_np = self._signal[idx]
         noisy_np = self._noisy[idx]
-        # shape -> [1, L]
+
+        clean = torch.from_numpy(clean_np).float().unsqueeze(0)
         noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)
 
         # per-sample sigma from noisy waveform (avoid zeros)
         s = noisy.std()
         sigma = s if s > 0 else torch.tensor(1.0, dtype=torch.float32)
 
-        noisy_norm = noisy / sigma
         length = noisy.shape[-1]
-        return noisy_norm, sigma, length
+        return clean, noisy, sigma, length
 
     def close(self):
         try:
@@ -93,6 +87,7 @@ class NoisyWaveDataset(Dataset):
         except Exception:
             pass
         self.h5 = None
+        self._signal = None
         self._noisy = None
 
     def __del__(self):
@@ -100,23 +95,13 @@ class NoisyWaveDataset(Dataset):
 
 
 def pad_collate(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, int]]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Left-padding to the longest sequence in the batch so that the final index aligns
     across samples (merger at t=0).
-
-    Input batch items:
-      noisy_norm: [1, L_i]
-      sigma     : []
-      length    : int
-
-    Returns:
-      noisy_padded : [B, 1, Lmax]
-      sigma        : [B]
-      mask_padded  : [B, 1, Lmax]   (1 on valid region, 0 on left padding)
     """
-    noisy_list, sigma_list, len_list = zip(*batch)
+    clean_list, noisy_list, sigma_list, len_list = zip(*batch)
     Lmax = int(max(len_list))
 
     def _pad_left(x: torch.Tensor, target: int) -> torch.Tensor:
@@ -124,6 +109,7 @@ def pad_collate(
         return F.pad(x, (pad, 0)) if pad > 0 else x
 
     # pad inputs and make masks
+    clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)   # [B,1,Lmax]
     noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)   # [B,1,Lmax]
     mask_pad  = torch.stack([
         _pad_left(torch.ones_like(x, dtype=torch.float32), Lmax) for x in noisy_list
@@ -135,7 +121,7 @@ def pad_collate(
         for s in sigma_list
     ], dim=0)                                                                   # [B]
 
-    return noisy_pad, sigma, mask_pad
+    return clean_pad, noisy_pad, sigma, mask_pad
 
 
 def make_dataloader(
