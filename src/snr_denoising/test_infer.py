@@ -15,6 +15,7 @@ def _slugify_title(s: str) -> str:
         return ""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
 
+
 class InferenceDataset(Dataset):
     """
     HDF5 expected (new gen.py):
@@ -42,9 +43,8 @@ class InferenceDataset(Dataset):
 
     def _times_rel(self, idx: int, L: int) -> np.ndarray:
         """
-        Return seconds-relative time with t=0 at the local merger (max |signal|).
-        Uses stored 'times' if available, but re-centers on the peak unless the file
-        explicitly says it already.
+        Return seconds-relative time with t=0 at the local merger.
+        NOTE: This assumes the requested L matches the array used to locate the peak.
         """
         axis = (self.time_axis or "").lower()
 
@@ -57,21 +57,19 @@ class InferenceDataset(Dataset):
             pk = int(np.argmax(np.abs(s)))
             return t - t[pk]
 
-        # Fallback: build a time vector from delta_t and center on the peak index.
+        # Fallback: build a time vector from delta_t and center on the peak index (of the signal).
         s = self.signal[idx]
         pk = int(np.argmax(np.abs(s)))
         base = np.arange(L, dtype=np.float64) * self.delta_t
-        return base - base[pk]
+        # If pk >= L (mismatched lengths), clamp to valid range
+        pk_clamped = min(max(pk, 0), L - 1)
+        return base - base[pk_clamped]
 
     def __getitem__(self, idx):
-        clean_raw = torch.from_numpy(self.signal[idx]).float().unsqueeze(0)  # [1, L]
-        noisy_raw = torch.from_numpy(self.noisy[idx]).float().unsqueeze(0)   # [1, L]
-        L = noisy_raw.shape[-1]
+        clean_raw = torch.from_numpy(self.signal[idx]).float().unsqueeze(0)
+        noisy_raw = torch.from_numpy(self.noisy[idx]).float().unsqueeze(0)
 
-        t_rel = self._times_rel(idx, L)
-
-        # per-sample sigma from noisy
-        s = noisy_raw.std()
+        s = noisy_raw.std()     # per-sample sigma from noisy
         sigma = s if s > 0 else torch.tensor(1.0)
         clean_norm = clean_raw / sigma
 
@@ -86,10 +84,11 @@ class InferenceDataset(Dataset):
         snr_meta = float(self.meta["snr"][idx]) if "snr" in self.meta else None
 
         return {
-            "clean_norm": clean_norm,  # [1, L]
-            "clean_raw":  clean_raw,   # [1, L]
-            "noisy_raw":  noisy_raw,   # [1, L]
-            "times_rel":  t_rel,       # (L,)
+            "clean_norm": clean_norm,  # [1, Lc]
+            "clean_raw":  clean_raw,   # [1, Lc]
+            "noisy_raw":  noisy_raw,   # [1, Ln]
+            # keep times_rel for legacy, but we won't rely on it when lengths differ
+            "times_rel":  None,
             "sigma":      sigma,       # scalar tensor
             "m1": m1,
             "m2": m2,
@@ -107,22 +106,98 @@ class InferenceDataset(Dataset):
         self.close()
 
 
-
 def snr_from_alpha_bar(alpha_bar: torch.Tensor) -> np.ndarray:
     """SNR(t) = sqrt(alpha_bar / (1 - alpha_bar))"""
     ab = alpha_bar.detach().cpu().numpy()
     return np.sqrt(ab / (1.0 - ab))
+
 
 def t_for_target_snr(diffusion, target_snr: float) -> (int, float):
     snr_ts = snr_from_alpha_bar(diffusion.alpha_bar)
     t = int(np.argmin(np.abs(snr_ts - target_snr)))
     return t, float(snr_ts[t])
 
-def one_step_recon(model, diffusion, clean_norm: torch.Tensor, sigma: torch.Tensor, t_scalar: int) -> torch.Tensor:
+
+def _ensure_3d(x: torch.Tensor) -> torch.Tensor:
     """
-    x0_hat_norm = (x_t - sqrt(1 - alpha_bar[t]) * eps_hat) / sqrt(alpha_bar[t])
-    x0_hat_raw  = x0_hat_norm * sigma
+    Force 1D + 2D tensors to [B,1,L].
+      [L]   -> [1,1,L]
+      [1,L] -> [1,1,L]
+      [B,L] -> [B,1,L]
     """
+    if x.ndim == 1:
+        return x.view(1, 1, -1)
+    if x.ndim == 2:
+        return x.unsqueeze(1)
+    return x
+
+
+def _peak_idx(y: np.ndarray) -> int:
+    return int(np.argmax(np.abs(y)))
+
+
+def _center_slice(L: int, center: int, out_len: int) -> slice:
+    half = out_len // 2
+    start = center - half
+    end = start + out_len
+    if start < 0:
+        start = 0
+        end = out_len
+    if end > L:
+        end = L
+        start = L - out_len
+    start = max(0, start)
+    end = min(L, end)
+    return slice(start, end)
+
+
+def align_for_overlay(noisy: np.ndarray, recon: np.ndarray, clean: np.ndarray, delta_t: float):
+    """
+    Center-crop each array around its own peak so that all three share the same length Lmin.
+    Build a symmetric time axis of length Lmin centered at 0.
+    Returns noisy_a, recon_a, clean_a, t_axis
+    """
+    Ln, Lr, Lc = len(noisy), len(recon), len(clean)
+    Lmin = min(Ln, Lr, Lc)
+
+    sn = _center_slice(Ln, _peak_idx(noisy), Lmin)
+    sr = _center_slice(Lr, _peak_idx(recon), Lmin)
+    sc = _center_slice(Lc, _peak_idx(clean), Lmin)
+
+    noisy_a = noisy[sn]
+    recon_a = recon[sr]
+    clean_a = clean[sc]
+
+    t = np.arange(Lmin, dtype=np.float64) * delta_t
+    t = t - t[Lmin // 2]
+    return noisy_a, recon_a, clean_a, t
+
+
+def align_for_metrics(clean: np.ndarray, recon: np.ndarray, delta_t: float):
+    """
+    Like align_for_overlay but only for (clean, recon).
+    """
+    Lr, Lc = len(recon), len(clean)
+    Lmin = min(Lr, Lc)
+
+    sr = _center_slice(Lr, _peak_idx(recon), Lmin)
+    sc = _center_slice(Lc, _peak_idx(clean), Lmin)
+
+    recon_a = recon[sr]
+    clean_a = clean[sc]
+
+    t = np.arange(Lmin, dtype=np.float64) * delta_t
+    t = t - t[Lmin // 2]
+    return clean_a, recon_a, t
+
+@torch.no_grad()
+def one_step_recon_uncond(model, diffusion, clean_norm: torch.Tensor, sigma: torch.Tensor, t_scalar: int) -> torch.Tensor:
+    """
+    Unconditional:
+      x0_hat_norm = (x_t - sqrt(1 - alpha_bar[t]) * eps_hat) / sqrt(alpha_bar[t])
+      x0_hat_raw  = x0_hat_norm * sigma
+    """
+    clean_norm = _ensure_3d(clean_norm)
     B = clean_norm.shape[0]
     device = clean_norm.device
     t = torch.full((B,), int(t_scalar), dtype=torch.long, device=device)
@@ -130,22 +205,53 @@ def one_step_recon(model, diffusion, clean_norm: torch.Tensor, sigma: torch.Tens
     eps_hat = model(x_t, t)
     ab = diffusion.alpha_bar[t_scalar]
     x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
-    return x0_hat_norm * sigma.view(-1, 1, 1)
+    sigma_311 = sigma.reshape(1, 1, 1).to(device)
+    return x0_hat_norm * sigma_311
 
+
+@torch.no_grad()
+def one_step_recon_cond(model, diffusion,
+                        clean_norm: torch.Tensor,
+                        cond_norm: torch.Tensor,
+                        sigma: torch.Tensor,
+                        t_scalar: int) -> torch.Tensor:
+    """
+    Conditional proxy (matches training diagnostics):
+      - Diffuse the CLEAN to x_t
+      - Condition the net on the NOISY measurement (normalized)
+      - Reconstruct x0 via DDPM formula (one-step proxy)
+    """
+    clean_norm = _ensure_3d(clean_norm)
+    cond_norm  = _ensure_3d(cond_norm)
+
+    B = clean_norm.shape[0]
+    device = clean_norm.device
+    t = torch.full((B,), int(t_scalar), dtype=torch.long, device=device)
+
+    x_t, _ = diffusion.q_sample(clean_norm, t)
+    net_in = torch.cat([x_t, cond_norm], dim=1)
+    eps_hat = model(net_in, t)
+    ab = diffusion.alpha_bar[t_scalar]
+    x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
+
+    sigma_311 = sigma.reshape(1, 1, 1).to(device)
+    return x0_hat_norm * sigma_311
 
 
 def even_pick(indices: list, k: int) -> list:
-    """Pick up to k indices evenly spaced from a list, preserving order."""
+    """Pick up to k indices evenly spaced from a list, whilst preserving order."""
     n = len(indices)
-    if n <= k: return indices
+    if n <= k:
+        return indices
     picks = np.linspace(0, n - 1, k)
     picks = np.unique(np.floor(picks).astype(int)).tolist()
     while len(picks) < k:
         picks.append(picks[-1])
     return [indices[i] for i in picks[:k]]
 
+
 def group_indices_by_mass(h5_path: str, unordered: bool = False):
-    """Return dict {(m1, m2): [idx, ...]} using label_m1/label_m2 if present, else mass1/mass2."""
+    """Return dict using label_m1/label_m2 if present, else mass1/mass2."""
     with h5py.File(h5_path, "r") as f:
         if "label_m1" in f and "label_m2" in f:
             m1 = np.array(f["label_m1"]); m2 = np.array(f["label_m2"])
@@ -160,6 +266,7 @@ def group_indices_by_mass(h5_path: str, unordered: bool = False):
         key = tuple(sorted((a, b))) if unordered else (a, b)
         groups.setdefault(key, []).append(int(i))
     return groups
+
 
 def plot_overlaid(
     tag: str,
@@ -183,7 +290,20 @@ def plot_overlaid(
     font_scale: float = 1.0,
     tight: bool = False,
 ):
-    lw_noisy *= line_scale; lw_recon *= line_scale; lw_clean *= line_scale
+
+    lw_noisy *= line_scale
+    lw_recon *= line_scale
+    lw_clean *= line_scale
+
+    # which to plot
+    show_noisy = plot_type in ("all", "noisy_recon")
+    show_recon = plot_type in ("all", "clean_recon", "noisy_recon")
+    show_clean = plot_type in ("all", "clean_recon")
+
+    # if clean is plotted, make recon slightly thicker but behind it
+    if show_recon and show_clean:
+        lw_recon = max(lw_recon, lw_clean * 1.15)
+
     with plt.rc_context({
         "font.size":        10 * font_scale,
         "axes.titlesize":   12 * font_scale,
@@ -193,12 +313,13 @@ def plot_overlaid(
         "legend.fontsize":   9 * font_scale,
     }):
         plt.figure(figsize=(fig_w, fig_h))
-        if plot_type in ("all", "noisy_recon"):
-            plt.plot(t_1d, noisy_1d, label="Noisy", alpha=0.6, linewidth=lw_noisy)
-        if plot_type in ("all", "clean_recon", "noisy_recon"):
-            plt.plot(t_1d, recon_1d, label="Recon", alpha=0.8, linewidth=lw_recon)
-        if plot_type in ("all", "clean_recon"):
-            plt.plot(t_1d, clean_1d, label="Clean", alpha=1.0, linewidth=lw_clean)
+
+        if show_noisy:
+            plt.plot(t_1d, noisy_1d, label="Noisy", alpha=0.6, linewidth=lw_noisy, zorder=0)
+        if show_recon:
+            plt.plot(t_1d, recon_1d, label="Recon", alpha=0.8, linewidth=lw_recon, zorder=1)
+        if show_clean:
+            plt.plot(t_1d, clean_1d, label="Clean", alpha=1.0, linewidth=lw_clean, zorder=2)
 
         full_title = title
         if global_title:
@@ -220,45 +341,99 @@ def plot_overlaid(
         plt.close()
 
 
-
 @torch.no_grad()
-def compute_mae_per_combo(ds: InferenceDataset, model, diffusion, t_pick: int, device, groups, outdir) -> dict:
+def compute_mae_per_combo(
+    ds: InferenceDataset,
+    model,
+    diffusion,
+    t_pick: int,
+    device,
+    groups,
+    outdir,
+    metric: str = "mae",
+    win_before_ms: float = 0.0,
+    win_after_ms: float = 0.0,
+    per_combo_max_samples: int = 0,
+    conditional: bool = False,
+) -> dict:
     """
-    Returns dict: {(m1,m2): {"mae": float, "count": int}} and also saves a CSV.
-    MAE is averaged across all samples belonging to that (m1, m2) combo.
+    Returns dict: {(m1,m2): {"score": float, "count": int}} and also saves a CSV.
+    metric:
+      - "mae"         : mean (recon - clean)
+      - "nmae_clean"  : MAE / mean(clean)   (computed over the same window/range)
+      - "nmae_sigma"  : MAE / sigma         (per-sample noisy std)
+    Optional windowing around merger event at t=0 using [ -window_before_ms, +window_after_ms ].
     """
+    eps = 1e-12
+    use_window = (win_before_ms > 0.0) or (win_after_ms > 0.0)
+    lb_s = -win_before_ms / 1000.0
+    ub_s =  win_after_ms / 1000.0
+
     combo_stats = {}
     os.makedirs(outdir, exist_ok=True)
 
-    for combo_idx, (combo, idx_list) in enumerate(sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1]))):
-        maes = []
-        for idx in idx_list:
+    ordered = sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+    for combo_idx, (combo, idx_list) in enumerate(ordered):
+        if per_combo_max_samples and per_combo_max_samples > 0:
+            use_indices = even_pick(idx_list, per_combo_max_samples)
+        else:
+            use_indices = idx_list
+
+        scores = []
+        for idx in use_indices:
             item = ds[idx]
             clean_norm = item["clean_norm"].to(device)
             clean_raw  = item["clean_raw"].to(device)
-            sigma      = item["sigma"].to(device)
+            noisy_raw  = item["noisy_raw"].to(device)
+            sigma      = item["sigma"]
 
-            # one-step reconstruction
-            x0_hat_raw = one_step_recon(model, diffusion, clean_norm, sigma, t_pick)
+            # one-step reconstruction (conditional vs uncond)
+            if conditional:
+                cond_norm = (noisy_raw.to(device) / sigma.to(device).view(1, 1))   # [1,L] -> forced to [1,1,L]
+                x0_hat_raw = one_step_recon_cond(model, diffusion, clean_norm, cond_norm, sigma.to(device), t_pick)
+            else:
+                x0_hat_raw = one_step_recon_uncond(model, diffusion, clean_norm, sigma.to(device), t_pick)
 
-            # MAE over the 1D waveform
-            err = torch.mean(torch.abs(x0_hat_raw - clean_raw)).item()
-            maes.append(err)
 
-        combo_stats[combo] = {"mae": float(np.mean(maes) if maes else np.nan),
-                              "count": int(len(maes))}
+            clean_1d = clean_raw[0].detach().cpu().numpy().ravel()
+            recon_1d = x0_hat_raw[0].detach().cpu().numpy().ravel()
+
+            clean_a, recon_a, t_axis = align_for_metrics(clean_1d, recon_1d, ds.delta_t)
+            if use_window:
+                mask = (t_axis >= lb_s) & (t_axis <= ub_s)
+            else:
+                mask = slice(None)
+
+            mae = float(np.mean(np.abs(recon_a[mask] - clean_a[mask])))
+
+            if metric == "mae":
+                score = mae
+            elif metric == "nmae_clean":
+                denom = float(np.mean(np.abs(clean_a[mask]))) + eps
+                score = mae / denom
+            elif metric == "nmae_sigma":
+                denom = float(sigma.item()) + eps
+                score = mae / denom
+            else:
+                raise ValueError(f"unknown metric: {metric}")
+
+            scores.append(score)
+
+        combo_stats[combo] = {"score": float(np.mean(scores) if scores else np.nan),
+                              "count": int(len(scores))}
         print(f"[metric] combo {combo_idx+1}/{len(groups)} {combo}: "
-              f"n={len(maes)}, MAE={combo_stats[combo]['mae']:.6e}")
+              f"n={len(scores)}, {metric}={combo_stats[combo]['score']:.6e}")
 
-    csv_path = os.path.join(outdir, "combo_mae.csv")
+    csv_path = os.path.join(outdir, "combo_scores.csv")
     with open(csv_path, "w") as fh:
-        fh.write("index,m1,m2,count,mae\n")
-        for i, (combo, stats) in enumerate(sorted(combo_stats.items(), key=lambda kv: (kv[0][0], kv[0][1]))):
+        fh.write("index,m1,m2,count,metric,score\n")
+        for i, (combo, _idxs) in enumerate(ordered):
             m1, m2 = combo
-            fh.write(f"{i},{m1},{m2},{stats['count']},{stats['mae']}\n")
+            fh.write(f"{i},{m1},{m2},{combo_stats[combo]['count']},{metric},{combo_stats[combo]['score']}\n")
     print(f"[metric] wrote: {csv_path}")
 
     return combo_stats
+
 
 def _axes_from_h5(h5_path: str):
     """
@@ -277,24 +452,35 @@ def _axes_from_h5(h5_path: str):
     return None, None
 
 
-def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi: int = 150, tight: bool = True,
-                           m1_axis_expected=None, m2_axis_expected=None, title: str = "", filename_suffix: str = ""):
+def save_mass_grid_heatmap(
+    combo_stats: dict,
+    outdir: str,
+    ext: str = "png",
+    dpi: int = 150,
+    tight: bool = True,
+    m1_axis_expected=None,
+    m2_axis_expected=None,
+    title: str = "",
+    filename_suffix: str = "",
+    cbar_label: str = "MAE",
+    basename: str = "metric_mass_grid",
+):
     """
     Build a grid with:
       rows  = sorted unique m1 values (use expected axes if provided)
       cols  = sorted unique m2 values (use expected axes if provided)
-      cell(m1, m2) = MAE for that combo if it exists (typically only for m2 <= m1).
-    Missing combos remain NaN (shown blank). Writes mapping CSV + missing_pairs.csv.
+      cell(m1, m2) = score for that combo (MAE or NMAE).
+    Missing combos remain NaN. Writes mapping CSV + missing_pairs.csv log.
     """
     combos = list(combo_stats.keys())
     if not combos:
         print("[metric] No combos to plot.")
         return
 
-    # Axes: rows=m1, cols=m2
+
     if m1_axis_expected is not None and m2_axis_expected is not None:
-        m1_vals = list(m1_axis_expected)  # rows
-        m2_vals = list(m2_axis_expected)  # cols
+        m1_vals = list(m1_axis_expected)
+        m2_vals = list(m2_axis_expected)
     else:
         m1_vals = sorted({m1 for (m1, m2) in combos})
         m2_vals = sorted({m2 for (m1, m2) in combos})
@@ -303,13 +489,12 @@ def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi
     m2_to_col = {v: i for i, v in enumerate(m2_vals)}
 
     grid = np.full((len(m1_vals), len(m2_vals)), np.nan, dtype=np.float64)
-
     for (m1, m2), stats in combo_stats.items():
         if (m1 not in m1_to_row) or (m2 not in m2_to_col):
             continue
         r = m1_to_row[m1]
         c = m2_to_col[m2]
-        grid[r, c] = stats["mae"]
+        grid[r, c] = stats["score"]
 
     map_csv = os.path.join(outdir, "matrix_index_map.csv")
     with open(map_csv, "w") as fh:
@@ -320,6 +505,7 @@ def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi
             fh.write(f"y,{i},{v}\n")
     print(f"[metric] wrote: {map_csv}")
 
+    # list missing unordered pairs (m2 <= m1)
     expected = {(m1, m2) for m1 in m1_vals for m2 in m2_vals if m2 <= m1}
     present  = set(combo_stats.keys())
     missing  = sorted(list(expected - present), key=lambda t: (t[0], t[1]))
@@ -330,7 +516,8 @@ def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi
             fh.write(f"{m1},{m2}\n")
     print(f"[metric] wrote: {miss_csv}  (missing={len(missing)})")
 
-    masked = np.ma.masked_invalid(grid)     # plot heatmap (mask NaNs)
+    # heatmap
+    masked = np.ma.masked_invalid(grid)
     cmap = plt.cm.viridis
     cmap.set_bad(color='white')
 
@@ -340,9 +527,9 @@ def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi
     plt.figure(figsize=(fig_w, fig_h))
     im = plt.imshow(masked, interpolation="nearest", aspect="auto", cmap=cmap)
     cbar = plt.colorbar(im)
-    cbar.set_label("MAE (|recon - clean|)")
+    cbar.set_label(cbar_label)
 
-    plt.title(title if title else "Mean Absolute Error by Mass Combo (rows=m1, cols=m2)")
+    plt.title(title if title else "Error by Mass Combo (rows=m1, cols=m2)")
     plt.xlabel("m2")
     plt.ylabel("m1")
 
@@ -354,15 +541,14 @@ def save_mass_grid_heatmap(combo_stats: dict, outdir: str, ext: str = "png", dpi
     if tight:
         save_kwargs.update({"bbox_inches": "tight", "pad_inches": 0.02})
     suffix = f"_{filename_suffix}" if filename_suffix else ""
-    out_path = os.path.join(outdir, f"mae_mass_grid{suffix}.{ext}")
+    out_path = os.path.join(outdir, f"{basename}{suffix}.{ext}")
     plt.savefig(out_path, **save_kwargs)
     plt.close()
     print(f"[metric] wrote: {out_path}")
 
 
-
 def main():
-    ap = argparse.ArgumentParser(description="Plot overlays per mass combo with t=0 at merger, or compute MAE matrix.")
+    ap = argparse.ArgumentParser(description="Plot overlays per mass combo with t=0 at merger, or compute MAE/NMAE matrix.")
     ap.add_argument("--data", type=str, required=True, help="Path to HDF5 dataset")
     ap.add_argument("--model", type=str, required=True, help="Path to trained diffusion checkpoint (.pth)")
     ap.add_argument("--outdir", type=str, default="plots_by_mass", help="Where to save figures")
@@ -387,14 +573,31 @@ def main():
 
     # metric + matrix args
     ap.add_argument("--mass-combo-matrix", action="store_true",
-                    help="If set, compute MAE per mass combo and save a mass-grid heatmap instead of overlays.")
+                    help="If set, compute a per-mass-combo metric and save a mass-grid heatmap instead of overlays.")
     ap.add_argument("--matrix-ext", type=str, default="png", choices=["png", "pdf"],
-                    help="Image format for the MAE mass-grid heatmap")
+                    help="Image format for the mass-grid heatmap")
+
+    # metric options
+    ap.add_argument("--metric", type=str, default="mae",
+                    help="One or more metrics (comma-separated) from: mae, nmae_clean, nmae_sigma.")
+    ap.add_argument("--window-before-ms", type=float, default=0.0,
+                    help="If >0, restrict metric to times t >= -before_ms from merger (t=0).")
+    ap.add_argument("--window-after-ms", type=float, default=0.0,
+                    help="If >0, restrict metric to times t <= +after_ms from merger (t=0).")
+    ap.add_argument("--per-combo-max-samples", type=int, default=0,
+                    help="If >0, cap the number of examples used per (m1,m2) to this many, evenly spaced.")
 
     args = ap.parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     title_slug = _slugify_title(args.title)
     print(f"[info] device = {device}")
+
+
+    metrics = [m.strip() for m in args.metric.split(",") if m.strip()]
+    valid = {"mae", "nmae_clean", "nmae_sigma"}
+    for m in metrics:
+        if m not in valid:
+            raise ValueError(f"Unknown metric '{m}'. Choose from {sorted(valid)}")
 
     # mass groups (pass unordered=True if (m1,m2) normalized to (min,max))
     groups = group_indices_by_mass(args.data, unordered=args.unordered_pairs)
@@ -403,8 +606,11 @@ def main():
 
     # load model + diffusion
     ckpt = torch.load(args.model, map_location=device)
+    in_ch = ckpt.get("args", {}).get("in_ch", 1)
+    is_conditional = bool(ckpt.get("args", {}).get("conditional", False) or (in_ch >= 2))
+
     model = UNet1D(
-        in_ch=1,
+        in_ch=in_ch,
         base_ch=ckpt["args"]["base_ch"],
         time_dim=ckpt["args"]["time_dim"],
         depth=ckpt["args"]["depth"],
@@ -415,39 +621,63 @@ def main():
     diffusion = CustomDiffusion(T=ckpt["args"]["T"], device=device)
     t_pick, snr_at_t = t_for_target_snr(diffusion, args.target_snr)
     print(f"[info] target SNR={args.target_snr:.1f} --> t={t_pick} (actual SNR≈{snr_at_t:.2f})")
+    print(f"[info] checkpoint in_ch={in_ch} -> {'CONDITIONAL' if is_conditional else 'UNCONDITIONAL'} inference path")
 
     # dataset
     ds = InferenceDataset(args.data)
 
     if args.mass_combo_matrix:
-        # metric path
         out_metrics = os.path.join(args.outdir, "metrics")
         os.makedirs(out_metrics, exist_ok=True)
 
-        combo_stats = compute_mae_per_combo(
-            ds=ds, model=model, diffusion=diffusion, t_pick=t_pick,
-            device=device, groups=groups, outdir=out_metrics
-        )
-
-
         m1_axis, m2_axis = _axes_from_h5(args.data)
 
-        save_mass_grid_heatmap(
-            combo_stats,
-            outdir=out_metrics,
-            ext=args.matrix_ext,
-            dpi=args.dpi,
-            tight=True,
-            m1_axis_expected=m1_axis,
-            m2_axis_expected=m2_axis,
-            title=args.title,
-            filename_suffix=title_slug,
-        )
+        lbl_map = {
+            "mae":        "MAE (recon - clean)",
+            "nmae_clean": "Normalized MAE (per mean(clean))",
+            "nmae_sigma": "Normalized MAE (per noisy σ)",
+        }
+
+        win_suffix = ""
+        if args.window_before_ms > 0 or args.window_after_ms > 0:
+            win_suffix = f"_win_{int(args.window_before_ms)}ms_{int(args.window_after_ms)}ms"
+
+        # run metrics
+        for m in metrics:
+            combo_stats = compute_mae_per_combo(
+                ds=ds, model=model, diffusion=diffusion, t_pick=t_pick,
+                device=device, groups=groups, outdir=out_metrics,
+                metric=m,
+                win_before_ms=args.window_before_ms,
+                win_after_ms=args.window_after_ms,
+                per_combo_max_samples=args.per_combo_max_samples,
+                conditional=is_conditional,
+            )
+
+            cbar_label = lbl_map.get(m, m)
+            if win_suffix:
+                cbar_label += f" in [{-args.window_before_ms:.0f}ms, +{args.window_after_ms:.0f}ms]"
+
+            file_suffix = "_".join([s for s in [title_slug, m + win_suffix] if s])
+
+            save_mass_grid_heatmap(
+                combo_stats,
+                outdir=out_metrics,
+                ext=args.matrix_ext,
+                dpi=args.dpi,
+                tight=True,
+                m1_axis_expected=m1_axis,
+                m2_axis_expected=m2_axis,
+                title=args.title,
+                filename_suffix=file_suffix,
+                cbar_label=cbar_label,
+                basename="metric_mass_grid",
+            )
+
         ds.close()
         print(f"[complete] metrics written under: {out_metrics}")
         return
 
-    # plotting path
     def sort_key(key):
         m1, m2 = key
         if isinstance(m1, str):
@@ -470,24 +700,31 @@ def main():
             clean_raw  = item["clean_raw"].to(device)
             noisy_raw  = item["noisy_raw"].to(device)
             sigma      = item["sigma"].to(device)
-            t_rel      = item["times_rel"]  # numpy (L,)
 
             # one-step recon
-            x0_hat_raw = one_step_recon(model, diffusion, clean_norm, sigma, t_pick)
+            if is_conditional:
+                cond_norm = (noisy_raw / sigma.view(1, 1))  # [1,Ln]
+                x0_hat_raw = one_step_recon_cond(model, diffusion, clean_norm, cond_norm, sigma, t_pick)
+            else:
+                x0_hat_raw = one_step_recon_uncond(model, diffusion, clean_norm, sigma, t_pick)
 
             clean_1d = clean_raw[0].detach().cpu().numpy().ravel()
             noisy_1d = noisy_raw[0].detach().cpu().numpy().ravel()
             recon_1d = x0_hat_raw[0].detach().cpu().numpy().ravel()
 
-            local_title = f"(m1={m1}, m2={m2})  idx={idx}  t={t_pick}  SNR≈{snr_at_t:.1f}"
+            # Align/crop to common length and build matching time axis
+            noisy_a, recon_a, clean_a, t_axis = align_for_overlay(noisy_1d, recon_1d, clean_1d, ds.delta_t)
+
+            local_title = (f"(m1={m1}, m2={m2})  idx={idx}  t={t_pick}  "
+                           f"SNR≈{snr_at_t:.1f}  [{'COND' if is_conditional else 'UNCOND'}]")
             tag         = f"{tag_combo}_ex{j}_idx{idx}"
 
             plot_overlaid(
                 tag=tag,
-                t_1d=t_rel,
-                noisy_1d=noisy_1d,
-                recon_1d=recon_1d,
-                clean_1d=clean_1d,
+                t_1d=t_axis,
+                noisy_1d=noisy_a,
+                recon_1d=recon_a,
+                clean_1d=clean_a,
                 out_dir=out_dir_combo,
                 title=local_title,
                 global_title=args.title,
