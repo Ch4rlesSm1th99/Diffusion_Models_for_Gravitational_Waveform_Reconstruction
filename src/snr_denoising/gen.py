@@ -9,6 +9,8 @@ from pycbc.filter import sigma
 import os
 import h5py
 import json
+import tempfile
+
 
 """
 gen.py — Generate time-domain GW waveforms with LIGO-like noise, and write HDF5 datasets with separate properties.
@@ -272,60 +274,85 @@ def finalize_and_write(
     detectors_bytes=None,
     full_psd_list=None
 ):
-    """Write HDF5 with variable-length datasets (no padding now), and times centered at merger event (t=0)."""
+    """Write HDF5 with variable-length datasets (no padding), and times centered at merger (t=0 at abs(signal) peak)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    lengths = np.array([len(x) for x in sig_list], dtype=np.int32)
-    delta_t = 1.0 / float(sampling_rate)
+
+    def _to_vlen_object(arr_list, dtype=np.float32):
+        obj = np.empty(len(arr_list), dtype=object)
+        for i, a in enumerate(arr_list):
+            a_np = np.asarray(a, dtype=dtype)
+            if a_np.ndim == 0:                 # protect against scalars
+                a_np = a_np.reshape(1)
+            elif a_np.ndim > 1:                # flatten any accidental 2D
+                a_np = a_np.reshape(-1)
+            obj[i] = a_np
+        return obj
+
+
+    sig_obj   = _to_vlen_object(sig_list,   np.float32)
+    noise_obj = _to_vlen_object(noise_list, np.float32)
+    noisy_obj = _to_vlen_object(noisy_list, np.float32)
+
+    # center each sample at the merger: t_rel = t_abs - t_peak_abs
+    times_vlen = []
+    t_mergers  = []
+    for sig_np, t_abs in zip(sig_list, t_list):
+        s = np.asarray(sig_np)
+        t = np.asarray(t_abs, dtype=np.float64)
+        if s.ndim == 0:          # just in case
+            pk = 0
+        else:
+            pk = int(np.argmax(np.abs(s)))
+        t0 = float(t[pk])
+        times_vlen.append((t - t0).astype(np.float64))
+        t_mergers.append(t0)
+
+    times_obj = _to_vlen_object(times_vlen, np.float64)
+
+    lengths   = np.array([len(x) for x in sig_list], dtype=np.int32)
+    delta_t   = 1.0 / float(sampling_rate)
+
+    # HDF5 dtypes
+    vlen_f32 = h5py.vlen_dtype(np.dtype('float32'))
+    vlen_f64 = h5py.vlen_dtype(np.dtype('float64'))
+    vlen_str = h5py.vlen_dtype(bytes)
 
     def _write_common(f):
         for k, arr in meta.items():
             if arr:
                 f.create_dataset(k, data=np.array(arr, dtype=np.float32))
         if detectors_bytes is not None:
-            vlen_str = h5py.special_dtype(vlen=bytes)
-            f.create_dataset('psd_detector', data=np.array(detectors_bytes, dtype=object), dtype=vlen_str)
-
-        # PSD full vectors
+            f.create_dataset('psd_detector',
+                             data=np.array(detectors_bytes, dtype=object),
+                             dtype=vlen_str)
+        # optional full PSD vectors
         if full_psd_list is not None:
-            vlen_f32 = h5py.special_dtype(vlen=np.float32)
-            f.create_dataset('psd', (len(full_psd_list),), dtype=vlen_f32, data=full_psd_list)
+            psd_obj = _to_vlen_object(full_psd_list, np.float32)
+            f.create_dataset('psd', data=psd_obj, dtype=vlen_f32)
 
         # attrs
-        f.attrs['padding'] = 'none'
-        f.attrs['sampling_rate'] = float(sampling_rate)
-        f.attrs['delta_t'] = float(delta_t)
-        f.attrs['time_axis'] = 'seconds-rel-peak'  # t=0 at merger event
+        f.attrs['padding']        = 'none'
+        f.attrs['sampling_rate']  = float(sampling_rate)
+        f.attrs['delta_t']        = float(delta_t)
+        f.attrs['time_axis']      = 'seconds-rel-peak'  # t=0 at merger (abs(signal) peak)
         if attrs_extra:
             for k, v in attrs_extra.items():
                 f.attrs[k] = v
 
-    # variable-length storage per sample
-    vlen_f32 = h5py.special_dtype(vlen=np.float32)
-    vlen_f64 = h5py.special_dtype(vlen=np.float64)
-
-    # center each sample at the merger t_rel = t_abs - t_peak_abs
-    times_vlen = []
-    t_mergers = []
-    for sig_np, t_abs in zip(sig_list, t_list):
-        # if signal is all zeros, fall back to last sample
-        if np.max(np.abs(sig_np)) > 0:
-            pk = int(np.argmax(np.abs(sig_np)))
-        else:
-            pk = len(sig_np) - 1
-        t0 = float(t_abs[pk])  # absolute time at peak
-        t_rel = (t_abs - t0).astype(np.float64)
-        times_vlen.append(t_rel)
-        t_mergers.append(t0)
-
     with h5py.File(output_path, 'w') as f:
-        f.create_dataset('signal', (len(sig_list),), dtype=vlen_f32, data=sig_list)
-        f.create_dataset('noise',  (len(noise_list),), dtype=vlen_f32, data=noise_list)
-        f.create_dataset('noisy',  (len(noisy_list),), dtype=vlen_f32, data=noisy_list)
-        f.create_dataset('times',  (len(times_vlen),), dtype=vlen_f64, data=times_vlen)
+        f.create_dataset('signal', data=sig_obj,   dtype=vlen_f32)
+        f.create_dataset('noise',  data=noise_obj, dtype=vlen_f32)
+        f.create_dataset('noisy',  data=noisy_obj, dtype=vlen_f32)
+        f.create_dataset('times',  data=times_obj, dtype=vlen_f64)
         f.create_dataset('t_merger', data=np.array(t_mergers, dtype=np.float64))
-        f.create_dataset('lengths', data=lengths)
+        f.create_dataset('lengths',  data=lengths)
         _write_common(f)
-    print(f"saved {len(sig_list)} samples (padding=none, time_axis=seconds-rel-peak; t=0 at |signal| peak) --> {output_path}")
+
+    print(f"saved {len(sig_list)} samples "
+          f"(padding=none, time_axis=seconds-rel-peak; t=0 at |signal| peak) "
+          f"--> {output_path}")
+
+
 
 
 if __name__ == "__main__":
