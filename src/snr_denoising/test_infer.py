@@ -61,7 +61,6 @@ class InferenceDataset(Dataset):
         s = self.signal[idx]
         pk = int(np.argmax(np.abs(s)))
         base = np.arange(L, dtype=np.float64) * self.delta_t
-        # If pk >= L (mismatched lengths), clamp to valid range
         pk_clamped = min(max(pk, 0), L - 1)
         return base - base[pk_clamped]
 
@@ -87,8 +86,7 @@ class InferenceDataset(Dataset):
             "clean_norm": clean_norm,  # [1, Lc]
             "clean_raw":  clean_raw,   # [1, Lc]
             "noisy_raw":  noisy_raw,   # [1, Ln]
-            # keep times_rel for legacy, but we won't rely on it when lengths differ
-            "times_rel":  None,
+            "times_rel":  None,        # legacy; not relied upon when lengths differ
             "sigma":      sigma,       # scalar tensor
             "m1": m1,
             "m2": m2,
@@ -190,6 +188,90 @@ def align_for_metrics(clean: np.ndarray, recon: np.ndarray, delta_t: float):
     t = t - t[Lmin // 2]
     return clean_a, recon_a, t
 
+
+# ---------- xcorr-based alignment helpers ----------
+def _overlap_slices_for_lag(n_a: int, n_b: int, k: int):
+    """
+    For arrays a (length n_a) and b (length n_b), with lag k meaning
+    'shift b to the RIGHT by k' (k>0), return slices that produce
+    overlapping regions a[a0:a1], b[b0:b1] of equal length.
+    """
+    start = max(0, -k)
+    stop  = min(n_a, n_b - k)
+    if stop <= start:
+        return slice(0, 0), slice(0, 0)
+    return slice(start, stop), slice(start + k, stop + k)
+
+
+def _best_lag_by_xcorr(a: np.ndarray, b: np.ndarray, max_shift: int) -> int:
+    """Return integer lag k (k>0 means shift b to the RIGHT) maximizing dot within ±max_shift."""
+    if max_shift <= 0:
+        # full-length search
+        max_shift = min(len(a), len(b)) - 1
+    best_k, best_val = 0, -np.inf
+    L = min(len(a), len(b))
+    a = a[:L]; b = b[:L]
+    for k in range(-max_shift, max_shift + 1):
+        if k < 0:   # b left
+            v = np.dot(a[-k:], b[:L + k])
+        elif k > 0: # b right
+            v = np.dot(a[:L - k], b[k:])
+        else:
+            v = np.dot(a, b)
+        if v > best_val:
+            best_val, best_k = v, k
+    return best_k
+
+
+def align_for_overlay_xcorr(noisy: np.ndarray,
+                            recon: np.ndarray,
+                            clean: np.ndarray,
+                            delta_t: float,
+                            max_shift: int = 0):
+    """
+    Align RECON to CLEAN by cross-correlation, then crop NOISY to the same
+    overlapped segment. Build a time axis whose t=0 is the CLEAN peak.
+    """
+    k = _best_lag_by_xcorr(clean, recon, max_shift)
+    s_clean, s_recon = _overlap_slices_for_lag(len(clean), len(recon), k)
+    clean_a = clean[s_clean]
+    recon_a = recon[s_recon]
+    noisy_a = noisy[s_clean]  # share clean's slice
+
+    L = len(clean_a)
+    if L == 0:
+        # Fallback to peak-centered cropping if overlap is empty
+        return align_for_overlay(noisy, recon, clean, delta_t)
+
+    pk_c = int(np.argmax(np.abs(clean_a)))
+    t = np.arange(L, dtype=np.float64) * delta_t
+    t -= t[pk_c]
+    return noisy_a, recon_a, clean_a, t
+
+
+def align_for_metrics_xcorr(clean: np.ndarray,
+                            recon: np.ndarray,
+                            delta_t: float,
+                            max_shift: int = 0):
+    """
+    Align RECON to CLEAN by cross-correlation and return (clean_a, recon_a, t).
+    """
+    k = _best_lag_by_xcorr(clean, recon, max_shift)
+    s_clean, s_recon = _overlap_slices_for_lag(len(clean), len(recon), k)
+    clean_a = clean[s_clean]
+    recon_a = recon[s_recon]
+
+    L = len(clean_a)
+    if L == 0:
+        return align_for_metrics(clean, recon, delta_t)
+
+    pk_c = int(np.argmax(np.abs(clean_a)))
+    t = np.arange(L, dtype=np.float64) * delta_t
+    t -= t[pk_c]
+    return clean_a, recon_a, t
+# ----------------------------------------------------
+
+
 @torch.no_grad()
 def one_step_recon_uncond(model, diffusion, clean_norm: torch.Tensor, sigma: torch.Tensor, t_scalar: int) -> torch.Tensor:
     """
@@ -290,7 +372,6 @@ def plot_overlaid(
     font_scale: float = 1.0,
     tight: bool = False,
 ):
-
     lw_noisy *= line_scale
     lw_recon *= line_scale
     lw_clean *= line_scale
@@ -341,6 +422,13 @@ def plot_overlaid(
         plt.close()
 
 
+def _combo_sort_key(combo):
+    m1, m2 = combo
+    if isinstance(m1, str):
+        return (float("inf"), float("inf"))
+    return (m1, m2)
+
+
 @torch.no_grad()
 def compute_mae_per_combo(
     ds: InferenceDataset,
@@ -355,14 +443,18 @@ def compute_mae_per_combo(
     win_after_ms: float = 0.0,
     per_combo_max_samples: int = 0,
     conditional: bool = False,
+    metric_align: str = "xcorr",
+    xcorr_max_shift: int = 0,
 ) -> dict:
     """
     Returns dict: {(m1,m2): {"score": float, "count": int}} and also saves a CSV.
     metric:
-      - "mae"         : mean (recon - clean)
-      - "nmae_clean"  : MAE / mean(clean)   (computed over the same window/range)
+      - "mae"         : mean(|recon - clean|)
+      - "nmae_clean"  : MAE / mean(|clean|)
       - "nmae_sigma"  : MAE / sigma         (per-sample noisy std)
     Optional windowing around merger event at t=0 using [ -window_before_ms, +window_after_ms ].
+    metric_align: 'peak' (peak-center both) or 'xcorr' (xcorr-align recon to clean).
+    xcorr_max_shift: half-window for lag search; 0 => full-length search.
     """
     eps = 1e-12
     use_window = (win_before_ms > 0.0) or (win_after_ms > 0.0)
@@ -372,7 +464,7 @@ def compute_mae_per_combo(
     combo_stats = {}
     os.makedirs(outdir, exist_ok=True)
 
-    ordered = sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+    ordered = sorted(groups.items(), key=lambda kv: _combo_sort_key(kv[0]))
     for combo_idx, (combo, idx_list) in enumerate(ordered):
         if per_combo_max_samples and per_combo_max_samples > 0:
             use_indices = even_pick(idx_list, per_combo_max_samples)
@@ -394,11 +486,17 @@ def compute_mae_per_combo(
             else:
                 x0_hat_raw = one_step_recon_uncond(model, diffusion, clean_norm, sigma.to(device), t_pick)
 
-
             clean_1d = clean_raw[0].detach().cpu().numpy().ravel()
             recon_1d = x0_hat_raw[0].detach().cpu().numpy().ravel()
 
-            clean_a, recon_a, t_axis = align_for_metrics(clean_1d, recon_1d, ds.delta_t)
+            # alignment choice for metric
+            if metric_align == "xcorr":
+                clean_a, recon_a, t_axis = align_for_metrics_xcorr(
+                    clean_1d, recon_1d, ds.delta_t, max_shift=xcorr_max_shift
+                )
+            else:
+                clean_a, recon_a, t_axis = align_for_metrics(clean_1d, recon_1d, ds.delta_t)
+
             if use_window:
                 mask = (t_axis >= lb_s) & (t_axis <= ub_s)
             else:
@@ -477,7 +575,6 @@ def save_mass_grid_heatmap(
         print("[metric] No combos to plot.")
         return
 
-
     if m1_axis_expected is not None and m2_axis_expected is not None:
         m1_vals = list(m1_axis_expected)
         m2_vals = list(m2_axis_expected)
@@ -516,7 +613,6 @@ def save_mass_grid_heatmap(
             fh.write(f"{m1},{m2}\n")
     print(f"[metric] wrote: {miss_csv}  (missing={len(missing)})")
 
-    # heatmap
     masked = np.ma.masked_invalid(grid)
     cmap = plt.cm.viridis
     cmap.set_bad(color='white')
@@ -587,11 +683,18 @@ def main():
     ap.add_argument("--per-combo-max-samples", type=int, default=0,
                     help="If >0, cap the number of examples used per (m1,m2) to this many, evenly spaced.")
 
+    # xcorr alignment options (kept, defaults chosen to fix previous misalignment)
+    ap.add_argument("--xcorr-window-samp", type=int, default=0,
+                    help="Half-window (samples) for cross-corr lag search. 0 = full-length search.")
+    ap.add_argument("--overlay-align", choices=["peak", "xcorr"], default="xcorr",
+                    help="Alignment for overlays: 'peak' (center each) or 'xcorr' (shift recon to clean).")
+    ap.add_argument("--metric-align", choices=["peak", "xcorr"], default="xcorr",
+                    help="Alignment for metrics: 'peak' or 'xcorr'.")
+
     args = ap.parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     title_slug = _slugify_title(args.title)
     print(f"[info] device = {device}")
-
 
     metrics = [m.strip() for m in args.metric.split(",") if m.strip()]
     valid = {"mae", "nmae_clean", "nmae_sigma"}
@@ -652,6 +755,8 @@ def main():
                 win_after_ms=args.window_after_ms,
                 per_combo_max_samples=args.per_combo_max_samples,
                 conditional=is_conditional,
+                metric_align=args.metric_align,
+                xcorr_max_shift=args.xcorr_window_samp,
             )
 
             cbar_label = lbl_map.get(m, m)
@@ -678,11 +783,9 @@ def main():
         print(f"[complete] metrics written under: {out_metrics}")
         return
 
-    def sort_key(key):
-        m1, m2 = key
-        if isinstance(m1, str):
-            return (float("inf"), float("inf"))
-        return (m1, m2)
+    # plotting overlays
+    def sort_key(combo):
+        return _combo_sort_key(combo)
 
     for combo_idx, (combo, idx_list) in enumerate(sorted(groups.items(), key=lambda kv: sort_key(kv[0]))):
         m1, m2 = combo
@@ -701,7 +804,7 @@ def main():
             noisy_raw  = item["noisy_raw"].to(device)
             sigma      = item["sigma"].to(device)
 
-            # one-step recon
+            # one-step recon (diagnostic proxy)
             if is_conditional:
                 cond_norm = (noisy_raw / sigma.view(1, 1))  # [1,Ln]
                 x0_hat_raw = one_step_recon_cond(model, diffusion, clean_norm, cond_norm, sigma, t_pick)
@@ -712,8 +815,13 @@ def main():
             noisy_1d = noisy_raw[0].detach().cpu().numpy().ravel()
             recon_1d = x0_hat_raw[0].detach().cpu().numpy().ravel()
 
-            # Align/crop to common length and build matching time axis
-            noisy_a, recon_a, clean_a, t_axis = align_for_overlay(noisy_1d, recon_1d, clean_1d, ds.delta_t)
+            # Align/crop to common length + build time axis (choose method)
+            if args.overlay_align == "xcorr":
+                noisy_a, recon_a, clean_a, t_axis = align_for_overlay_xcorr(
+                    noisy_1d, recon_1d, clean_1d, ds.delta_t, max_shift=args.xcorr_window_samp
+                )
+            else:
+                noisy_a, recon_a, clean_a, t_axis = align_for_overlay(noisy_1d, recon_1d, clean_1d, ds.delta_t)
 
             local_title = (f"(m1={m1}, m2={m2})  idx={idx}  t={t_pick}  "
                            f"SNR≈{snr_at_t:.1f}  [{'COND' if is_conditional else 'UNCOND'}]")

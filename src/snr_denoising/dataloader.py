@@ -6,34 +6,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, List
 
-DEFAULT_DATA_DIR = (
-    "/mnt/c/Users/charl/PycharmProjects/"
-    "Diffusion_Models_for_Gravitational_Waveform_Reconstruction/data/latest_data"
-)
+from numpy.fft import rfft, irfft, rfftfreq
 
-"""
-Dataloader utilities for LIGO GW diffusion training with padding.
-
-Key points:
-- Read variable-length HDF5 (no padding in the file).
-- Needs BOTH 'signal' (clean) and 'noisy' (PSD detector measurement).
-- Per-sample normalisation scale: sigma = std(noisy).
-- Batch-time padding in collate_fn:
-    * Left-pad with zeros so the final index is the merger (t=0).
-    * Build a 1/0 mask with ones over valid (unpadded) samples.
-
-Exports:
-- resolve_h5_path(path)
-- NoisyWaveDataset
-- pad_collate
-- make_dataloader(...)
-"""
+def _mad_std(x: np.ndarray) -> float:
+    x64 = np.asarray(x, dtype=np.float64)
+    return 1.4826 * np.median(np.abs(x64 - np.median(x64))) + 1e-24
 
 def resolve_h5_path(path: str) -> str:
-    """
-    If `path` is a file, return it.
-    If `path` is a directory, return the newest .h5/.hdf5 file in it.
-    """
     if os.path.isdir(path):
         cands = [f for f in os.listdir(path) if f.lower().endswith((".h5", ".hdf5"))]
         if not cands:
@@ -47,11 +26,16 @@ def resolve_h5_path(path: str) -> str:
 
 
 class NoisyWaveDataset(Dataset):
-    def __init__(self, h5_path: str):
+    def __init__(self, h5_path: str, whiten: bool = False,
+                 sigma_mode: str = "std", sigma_fixed: float = 1.0):
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
         self._signal = None
         self._noisy = None
+        self.whiten = whiten
+        self.sigma_mode = sigma_mode
+        self.sigma_fixed = float(sigma_fixed)
+        self.fs = None
 
     def _ensure_open(self):
         if self.h5 is None:
@@ -60,22 +44,57 @@ class NoisyWaveDataset(Dataset):
                 raise KeyError("HDF5 must contain both 'signal' and 'noisy' datasets.")
             self._signal = self.h5["signal"]
             self._noisy  = self.h5["noisy"]
+            # sampling rate
+            attrs = self.h5.attrs
+            fs = float(attrs.get("sampling_rate", 0.0)) or float(1.0 / attrs.get("delta_t", 1.0 / 4096.0))
+            self.fs = fs
 
     def __len__(self) -> int:
         with h5py.File(self.h5_path, "r") as f:
             return f["signal"].shape[0]
 
+    def _whiten_pair(self, y: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Whiten y AND x using PSD estimated from y (Welch-like via FFT bins)."""
+        L = len(y)
+        freqs = rfftfreq(L, 1.0 / self.fs)
+        # simple PSD estimate: average |Y|^2 in small freq bins via Welch replacement is ok here
+        # but to keep dependencies minimal, use a smooth-ish envelope by moving-average in freq domain
+        Y = rfft(y.astype(np.float64))
+        P = np.abs(Y) ** 2
+        # smooth PSD a bit
+        if P.size > 3:
+            kernel = np.ones(9, dtype=np.float64) / 9.0
+            P = np.convolve(P, kernel, mode='same')
+        P = np.maximum(P, 1e-24)
+        y_w = irfft(Y / np.sqrt(P), n=L)
+
+        X = rfft(x.astype(np.float64))
+        x_w = irfft(X / np.sqrt(P), n=L)
+        return y_w.astype(np.float32), x_w.astype(np.float32)
+
     def __getitem__(self, idx: int):
         self._ensure_open()
-        clean_np = self._signal[idx]
-        noisy_np = self._noisy[idx]
+        clean_np = np.array(self._signal[idx], dtype=np.float32)
+        noisy_np = np.array(self._noisy[idx], dtype=np.float32)
 
-        clean = torch.from_numpy(clean_np).float().unsqueeze(0)
-        noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)
+        if self.whiten:
+            noisy_np, clean_np = self._whiten_pair(noisy_np, clean_np)
 
-        # per-sample sigma from noisy waveform (avoid zeros)
-        s = noisy.std()
-        sigma = s if s > 0 else torch.tensor(1.0, dtype=torch.float32)
+        # per-sample sigma from y_for_cond (float64 for numerical stability)
+        if self.sigma_mode == "std":
+            s = float(np.std(noisy_np.astype(np.float64)))
+        elif self.sigma_mode == "mad":
+            s = float(_mad_std(noisy_np))
+        elif self.sigma_mode == "fixed":
+            s = float(self.sigma_fixed)
+        else:
+            raise ValueError(f"Unknown sigma_mode: {self.sigma_mode}")
+        if not np.isfinite(s) or s <= 0:
+            s = 1.0
+
+        clean = torch.from_numpy(clean_np).float().unsqueeze(0)  # [1,L]
+        noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)  # [1,L]
+        sigma = torch.tensor(s, dtype=torch.float32)
 
         length = noisy.shape[-1]
         return clean, noisy, sigma, length
@@ -97,10 +116,6 @@ class NoisyWaveDataset(Dataset):
 def pad_collate(
     batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Left-padding to the longest sequence in the batch so that the final index aligns
-    across samples (merger at t=0).
-    """
     clean_list, noisy_list, sigma_list, len_list = zip(*batch)
     Lmax = int(max(len_list))
 
@@ -108,14 +123,12 @@ def pad_collate(
         pad = target - x.shape[-1]
         return F.pad(x, (pad, 0)) if pad > 0 else x
 
-    # pad inputs and make masks
-    clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)   # [B,1,Lmax]
-    noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)   # [B,1,Lmax]
+    clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)   # [B,1,L]
+    noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)   # [B,1,L]
     mask_pad  = torch.stack([
         _pad_left(torch.ones_like(x, dtype=torch.float32), Lmax) for x in noisy_list
-    ], dim=0)                                                                  # [B,1,Lmax]
+    ], dim=0)                                                                  # [B,1,L]
 
-    # stack sigmas
     sigma = torch.stack([
         s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
         for s in sigma_list
@@ -132,8 +145,11 @@ def make_dataloader(
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
     pin_memory: bool = True,
+    whiten: bool = False,
+    sigma_mode: str = "std",
+    sigma_fixed: float = 1.0,
 ) -> DataLoader:
-    ds = NoisyWaveDataset(h5_path=h5_path)
+    ds = NoisyWaveDataset(h5_path=h5_path, whiten=whiten, sigma_mode=sigma_mode, sigma_fixed=sigma_fixed)
     loader = DataLoader(
         ds,
         batch_size=batch_size,

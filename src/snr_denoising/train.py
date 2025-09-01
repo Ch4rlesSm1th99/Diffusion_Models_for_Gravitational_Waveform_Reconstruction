@@ -1,11 +1,15 @@
 import argparse
 import os
+import json
+import time
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from copy import deepcopy
 
 from models import UNet1D, CustomDiffusion
 from dataloader import make_dataloader
@@ -14,13 +18,28 @@ def prepare_output_dir(base_dir: str) -> str:
     out_dir = os.path.join(base_dir, 'latest_model')
     if os.path.exists(out_dir):
         for file in os.listdir(out_dir):
-            os.remove(os.path.join(out_dir, file))
+            try:
+                os.remove(os.path.join(out_dir, file))
+            except Exception:
+                pass
     else:
         os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
+def set_seed(seed: int):
+    if seed is None:
+        return
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 @torch.no_grad()
 def _predict_x0_norm(model, diffusion, x_t, y_cond, t):
+    t = t.long()
     zeros_sc = torch.zeros_like(x_t)
     net_in = torch.cat([x_t, y_cond, zeros_sc], dim=1)
     eps_hat = model(net_in, t)
@@ -31,11 +50,47 @@ def _predict_x0_norm(model, diffusion, x_t, y_cond, t):
 def _element_loss(eps_hat, eps, mask, loss_type: str, huber_beta: float):
     if loss_type == "huber":
         el = F.smooth_l1_loss(eps_hat, eps, reduction="none", beta=huber_beta)
-    else:  # mse
-        el = (eps_hat - eps) ** 2
+    else:
+        el = (eps_hat - eps) ** 2       # mse
     return el * mask
 
+def _corr_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = a.reshape(-1) - a.mean()
+    b = b.reshape(-1) - b.mean()
+    den = (a.pow(2).sum().sqrt() * b.pow(2).sum().sqrt() + 1e-12)
+    return (a * b).sum() / den
+
+def _log_jsonl(path: str, obj: dict):
+    if not path:
+        return
+    with open(path, "a") as fh:
+        fh.write(json.dumps(obj) + "\n")
+
+# EMA helpers
+@torch.no_grad()
+def update_ema(ema_model, model, decay: float):
+    ema_params = dict(ema_model.named_parameters())
+    model_params = dict(model.named_parameters())
+    for k in ema_params.keys():
+        ema_params[k].data.mul_(decay).add_(model_params[k].data, alpha=(1.0 - decay))
+    # buffers
+    for (eb, mb) in zip(ema_model.buffers(), model.buffers()):
+        eb.copy_(mb)
+
+# LR schedule --> linear warmup then cosine
+def make_warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int, min_lr_scale: float = 0.1):
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return max(1e-8, float(step + 1) / max(1, warmup_steps))
+        # cosine from 1.0 down to min_lr_scale
+        progress = (step - warmup_steps) / max(1, (total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return min_lr_scale + 0.5 * (1 - min_lr_scale) * (1 + math.cos(math.pi * progress))
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def train_diffusion(args):
+    set_seed(args.seed)
     out_dir = prepare_output_dir(args.model_dir)
 
     loader: DataLoader = make_dataloader(
@@ -44,7 +99,7 @@ def train_diffusion(args):
         shuffle=True,
         num_workers=args.num_workers,
         prefetch_factor=2,
-        persistent_workers=True,
+        persistent_workers=True if args.num_workers > 0 else False,
         pin_memory=True,
         whiten=args.whiten,
         sigma_mode=args.sigma_mode,
@@ -52,19 +107,53 @@ def train_diffusion(args):
     )
 
     print(f"[train] Dataset size: {len(loader.dataset)}")
-    print(f"[train] Batches per epoch: {len(loader)}")
+    print(f"[train] Batches/epoch: {len(loader)} , device={args.device} , AMP={args.amp}")
 
     device = torch.device(args.device)
     in_ch = 3
-    model = UNet1D(in_ch=in_ch, base_ch=args.base_ch, time_dim=args.time_dim, depth=args.depth).to(device)
+
+    # pass t_embed_max_time=T-1 to match normalized time embedding
+    model = UNet1D(
+        in_ch=in_ch,
+        base_ch=args.base_ch,
+        time_dim=args.time_dim,
+        depth=args.depth,
+        t_embed_max_time=max(0, args.T - 1),
+    ).to(device)
+
     diffusion = CustomDiffusion(T=args.T, device=device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Optimizer + scheduler (optional)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    total_steps = len(loader) * args.epochs
+    scheduler = None
+    if args.warmup_steps > 0 or args.cosine_decay:
+        scheduler = make_warmup_cosine_scheduler(
+            optimizer,
+            warmup_steps=args.warmup_steps,
+            total_steps=total_steps,
+            min_lr_scale=args.min_lr_scale,
+        )
+
+    # EMA
+    ema_model = None
+    if args.ema:
+        ema_model = deepcopy(model)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+
+    # AMP
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    run_start = time.time()
+    global_step = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         sum_loss_weighted = 0.0
         sum_weight = 0
         batch_losses = []
+        skipped_batches = 0
 
         pbar = tqdm(
             loader, total=len(loader),
@@ -73,80 +162,99 @@ def train_diffusion(args):
         )
 
         # guidance/self-cond (can be forced off for early epochs)
-        p_uncond_eff   = 0.0 if epoch <= args.force_cond_epochs else args.p_uncond
+        p_uncond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_uncond
         p_selfcond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_selfcond
 
         for i, (clean_raw, noisy_raw, sigma, mask) in enumerate(pbar):
-            clean_raw = clean_raw.to(device).float()
-            noisy_raw = noisy_raw.to(device).float()
-            sigma     = sigma.to(device)
-            mask      = mask.to(device).float()
+            clean_raw = clean_raw.to(device, non_blocking=True).float()
+            noisy_raw = noisy_raw.to(device, non_blocking=True).float()
+            sigma = sigma.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True).float()
             bsz, _, L = clean_raw.shape
 
             sigma_ = sigma.view(-1, 1, 1)
             clean_norm = clean_raw / sigma_
-            cond_norm  = noisy_raw / sigma_
+            cond_norm = noisy_raw / sigma_
 
-            # optional clamping to prevent rare huge values
+            # optional clamping
             if args.clamp_inputs > 0:
                 clean_norm = clean_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
-                cond_norm  = cond_norm.clamp (-args.clamp_inputs, args.clamp_inputs)
+                cond_norm = cond_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
 
             # biased timestep sampling: t in [t_min, T-1]
             t_min = int(max(0, min(args.T - 1, int(args.t_min_frac * args.T))))
-            t = torch.randint(t_min, args.T, (bsz,), device=device)
+            t = torch.randint(t_min, args.T, (bsz,), device=device, dtype=torch.long)
 
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                x_t, eps = diffusion.q_sample(clean_norm, t)
 
-            x_t, eps = diffusion.q_sample(clean_norm, t)
+                if args.clamp_inputs > 0:
+                    x_t = x_t.clamp(-args.clamp_inputs, args.clamp_inputs)
 
-            if args.clamp_inputs > 0:
-                x_t = x_t.clamp(-args.clamp_inputs, args.clamp_inputs)
+                # CFG dropout (can be forced off)
+                if p_uncond_eff > 0.0:
+                    drop = (torch.rand(bsz, 1, 1, device=device) < p_uncond_eff).float()
+                    cond_used = cond_norm * (1.0 - drop)
+                else:
+                    cond_used = cond_norm
 
-            # CFG dropout (can be forced off)
-            if p_uncond_eff > 0.0:
-                drop = (torch.rand(bsz, 1, 1, device=device) < p_uncond_eff).float()
-                cond_used = cond_norm * (1.0 - drop)
-            else:
-                cond_used = cond_norm
+                # self-conditioning (can be forced off)
+                if p_selfcond_eff > 0.0 and torch.rand((), device=device) < p_selfcond_eff:
+                    with torch.no_grad():
+                        x0_sc = _predict_x0_norm(model, diffusion, x_t, cond_used, t)
+                else:
+                    x0_sc = torch.zeros_like(x_t)
 
-            # self-conditioning (can be forced off)
-            use_sc = (torch.rand((), device=device) < p_selfcond_eff).item() if p_selfcond_eff > 0.0 else False
-            if use_sc:
-                with torch.no_grad():
-                    x0_sc = _predict_x0_norm(model, diffusion, x_t, cond_used, t)
-            else:
-                x0_sc = torch.zeros_like(x_t)
+                net_in = torch.cat([x_t, cond_used, x0_sc], dim=1)
+                eps_hat = model(net_in, t)
 
-            net_in = torch.cat([x_t, cond_used, x0_sc], dim=1)
-            eps_hat = model(net_in, t)
+                # base element loss
+                el = _element_loss(eps_hat, eps, mask, args.loss, args.huber_beta)
 
-            # weighted loss
-            el = _element_loss(eps_hat, eps, mask, args.loss, args.huber_beta)
-            denom = mask.sum(dim=[1, 2]).clamp_min(1.0)
-            per_sample = el.sum(dim=[1, 2]) / denom
-            loss = per_sample.mean()
+                # optional timestep weighting (emphasize certain noise region)
+                if args.loss_weight_power != 0.0:
+                    ab = diffusion.alpha_bar[t].view(-1, 1, 1)
+                    # weight --> (1 - alpha_bar)^p ; p>0 emphasizes noisier steps
+                    w = (1.0 - ab).pow(args.loss_weight_power)
+                    el = el * w
 
-            # guardrails: skip bad batches with explosive loss
+                denom = mask.sum(dim=[1, 2]).clamp_min(1.0)
+                per_sample = el.sum(dim=[1, 2]) / denom
+                loss = per_sample.mean()
+
+            # romve any bad behaving batches
             if not torch.isfinite(loss):
-                pbar.write("[warn] non-finite loss — batch skipped")
+                pbar.write("[warn] non-finite loss - batch skipped")
+                skipped_batches += 1
                 continue
             if args.skip_bad_batches and loss.item() > args.skip_loss_threshold:
-                # batch stats for debug outliers
                 with torch.no_grad():
                     smin = sigma.min().item(); smean = sigma.mean().item(); smax = sigma.max().item()
                     cn_max = cond_norm.abs().max().item()
-                pbar.write(f"[warn] loss {loss.item():.3e} > {args.skip_loss_threshold} — "
+                pbar.write(f"[warn] loss {loss.item():.3e} > {args.skip_loss_threshold} "
                            f"skip (sigma[min/mean/max]={smin:.3e}/{smean:.3e}/{smax:.3e}, "
-                           f"|cond_norm|_max={cn_max:.3e})")
+                           f"(cond_norm)_max={cn_max:.3e})")
+                skipped_batches += 1
                 continue
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
 
+            # grad clip (unscale first if AMP)
+            grad_norm = None
             if args.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                scaler.unscale_(optimizer)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad).item())
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            # EMA update
+            if ema_model is not None:
+                update_ema(ema_model, model, args.ema_decay)
 
             # stats
             loss_val = float(loss.item())
@@ -154,7 +262,56 @@ def train_diffusion(args):
             sum_loss_weighted += loss_val * bsz
             sum_weight += bsz
             running_avg = sum_loss_weighted / max(1, sum_weight)
-            pbar.set_postfix(loss=f"{loss_val:.6f}", avg=f"{running_avg:.6f}")
+            lr_now = optimizer.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{loss_val:.6f}", avg=f"{running_avg:.6f}", lr=f"{lr_now:.2e}")
+
+            # JSONL (the per-batch log)
+            _log_jsonl(args.log_jsonl, {
+                "phase": "train_batch",
+                "step": global_step,
+                "epoch": epoch,
+                "batch": i,
+                "t_min": int(t.min().item()),
+                "t_mean": float(t.float().mean().item()),
+                "t_max": int(t.max().item()),
+                "loss": loss_val,
+                "grad_norm": grad_norm,
+                "lr": lr_now,
+            })
+            global_step += 1
+
+            # optional conditioning probe at selected timesteps
+            if args.probe_cond and (i % max(1, args.probe_interval) == 0):
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    c0 = (clean_norm[0:1]).detach()
+                    y0 = (cond_norm[0:1]).detach()
+                    zeros_y = torch.zeros_like(y0)
+                    zeros_sc = torch.zeros_like(c0)
+                    for t_pick in args.probe_t:
+                        t_probe = torch.tensor([max(0, min(args.T - 1, int(t_pick)))],
+                                               device=device, dtype=torch.long)
+                        x_t_p, eps_p = diffusion.q_sample(c0, t_probe)
+                        net_on = torch.cat([x_t_p, y0, zeros_sc], dim=1)
+                        net_off = torch.cat([x_t_p, zeros_y, zeros_sc], dim=1)
+                        eps_on = model(net_on, t_probe)
+                        eps_off = model(net_off, t_probe)
+                        mse_on = float(F.mse_loss(eps_on, eps_p).item())
+                        mse_off = float(F.mse_loss(eps_off, eps_p).item())
+                        corr_on = float(_corr_torch(eps_on, eps_p).item())
+                        corr_off = float(_corr_torch(eps_off, eps_p).item())
+                        delta = eps_on - eps_off
+                        delta_rms = float(torch.linalg.norm(delta.reshape(-1)) / (delta.numel() ** 0.5))
+                        _log_jsonl(args.log_jsonl, {
+                            "phase": "probe",
+                            "epoch": epoch,
+                            "batch": i,
+                            "t": int(t_pick),
+                            "mse_on": mse_on,
+                            "mse_off": mse_off,
+                            "corr_on": corr_on,
+                            "corr_off": corr_off,
+                            "cond_delta_rms": delta_rms,
+                        })
 
             if i == 0 and args.debug_first:
                 def _stats(x):
@@ -169,22 +326,32 @@ def train_diffusion(args):
                 print(f"[DEBUG] eps_hat:    min={eh_min:.3e}, max={eh_max:.3e}, mean={eh_mean:.3e}, std={eh_std:.3e}")
                 ab = diffusion.alpha_bar[t].view(-1, 1, 1)
                 x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
-                x0_hat = x0_hat_norm * sigma.view(-1,1,1)
+                x0_hat = x0_hat_norm * sigma.view(-1, 1, 1)
                 x0_min, x0_max, x0_mean, x0_std = _stats(x0_hat)
                 print(f"[DEBUG] recon_unnorm: min={x0_min:.3e}, max={x0_max:.3e}, mean={x0_mean:.3e}, std={x0_std:.3e}")
 
         avg_loss_per_sample = sum_loss_weighted / max(1, sum_weight)
-        avg_loss_per_batch  = float(np.mean(batch_losses)) if batch_losses else float("nan")
-        med_loss_per_batch  = float(np.median(batch_losses)) if batch_losses else float("nan")
+        avg_loss_per_batch = float(np.mean(batch_losses)) if batch_losses else float("nan")
+        med_loss_per_batch = float(np.median(batch_losses)) if batch_losses else float("nan")
         print(
             f"Epoch {epoch}/{args.epochs} - "
             f"Avg(per-sample)={avg_loss_per_sample:.6f} | "
             f"Mean(per-batch)={avg_loss_per_batch:.6f} | "
             f"Median(per-batch)={med_loss_per_batch:.6f}"
         )
+        _log_jsonl(args.log_jsonl, {
+            "phase": "epoch_end",
+            "epoch": epoch,
+            "avg_per_sample": avg_loss_per_sample,
+            "mean_per_batch": avg_loss_per_batch,
+            "median_per_batch": med_loss_per_batch,
+            "skipped_batches": skipped_batches,
+            "elapsed_s": float(time.time() - run_start),
+        })
 
+    # checkpoints (raw + EMA if enabled)
     save_path = os.path.join(out_dir, 'model_diffusion.pth')
-    torch.save({
+    payload = {
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'args': {
@@ -196,8 +363,12 @@ def train_diffusion(args):
             'sigma_mode': args.sigma_mode,
         },
         'epoch': args.epochs,
-    }, save_path)
+    }
+    if ema_model is not None:
+        payload['model_ema_state'] = ema_model.state_dict()
+    torch.save(payload, save_path)
     print(f"Saved model to {save_path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train conditional diffusion denoiser on LIGO waveforms")
@@ -205,15 +376,17 @@ if __name__ == '__main__':
     parser.add_argument('--model_dir',  type=str, default='model')
     parser.add_argument('--epochs',     type=int,   default=50)
     parser.add_argument('--batch-size', type=int,   default=16)
-    parser.add_argument('--lr',         type=float, default=1e-4)
+    parser.add_argument('--lr',         type=float, default=2e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--T',          type=int,   default=1000)
     parser.add_argument('--base_ch',    type=int,   default=64)
     parser.add_argument('--time_dim',   type=int,   default=128)
     parser.add_argument('--depth',      type=int,   default=3)
     parser.add_argument('--device',     type=str,   default=None)
     parser.add_argument('--num_workers',type=int,   default=4)
+    parser.add_argument('--seed',       type=int,   default=42)
 
-    # preprocessing to match deployment
+    # preprocessing to match inference
     parser.add_argument('--whiten', action='store_true')
     parser.add_argument('--sigma_mode', choices=['std','mad','fixed'], default='std')
     parser.add_argument('--sigma_fixed', type=float, default=1.0)
@@ -222,7 +395,7 @@ if __name__ == '__main__':
     parser.add_argument('--p_uncond',   type=float, default=0.2)
     parser.add_argument('--p_selfcond', type=float, default=0.5)
 
-    # NEW: training schedule tweaks
+    # training schedule tweaks
     parser.add_argument('--t_min_frac', type=float, default=0.5,
                         help='sample t uniformly from [t_min_frac*T, T-1]')
     parser.add_argument('--force_cond_epochs', type=int, default=0,
@@ -236,7 +409,29 @@ if __name__ == '__main__':
     parser.add_argument('--skip_bad_batches', action='store_true', default=True)
     parser.add_argument('--skip_loss_threshold', type=float, default=50.0)
 
+    # logging / probes
     parser.add_argument('--debug_first', action='store_true')
+    parser.add_argument('--log-jsonl', type=str, default=None,
+                        help='Append per-batch/probe metrics to this JSONL file')
+    parser.add_argument('--probe-cond', action='store_true',
+                        help='Enable conditioning probe (cond on vs off) during training')
+    parser.add_argument('--probe-t', type=int, nargs='*',
+                        default=[24, 50, 200, 500, 800],
+                        help='Timesteps to probe at if --probe-cond is set')
+    parser.add_argument('--probe-interval', type=int, default=50,
+                        help='Run the probe every N batches')
+
+    # AMP + EMA + schedule
+    parser.add_argument('--amp', action='store_true', help='Enable mixed precision')
+    parser.add_argument('--ema', action='store_true', help='Enable EMA of weights ')
+    parser.add_argument('--ema_decay', type=float, default=0.999)
+    parser.add_argument('--warmup_steps', type=int, default=1000)
+    parser.add_argument('--cosine_decay', action='store_true', help='Enable cosine decay after warmup')
+    parser.add_argument('--min_lr_scale', type=float, default=0.1, help='Final LR as fraction of base LR for cosine')
+
+    # (Optional) timestep loss weighting: weight --> (1 - alpha_bar[t])^p i.e --> scheduler
+    parser.add_argument('--loss_weight_power', type=float, default=0.0,
+                        help='0 disables; >0 emphasizes noisier steps')
 
     args = parser.parse_args()
     args.device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')

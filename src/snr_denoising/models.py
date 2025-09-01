@@ -1,80 +1,59 @@
+# models.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+# ------------------------- Time + Schedule -------------------------
 class TimeEmbedding(nn.Module):
-    '''
-    time embeddings using sin + cos encoding --> encodes the timestep 't' into a higher dim feature vector for training
-    '''
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2            # gen sin embeddings
-        emb = torch.exp(
+        half = self.dim // 2
+        freqs = torch.exp(
             torch.arange(half, dtype=torch.float32, device=t.device)
-            * -(math.log(10000) / (half - 1))           # shape = [B,half]
+            * -(math.log(10000) / max(half - 1, 1))
         )
-        emb = t[:, None].float() * emb[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=1)
-        if self.dim % 2 == 1:       # if odd dim --> pad with a zero column
+        x = t[:, None].float() * freqs[None, :]
+        emb = torch.cat([x.sin(), x.cos()], dim=1)
+        if self.dim % 2 == 1:
             emb = torch.cat([emb, torch.zeros(t.size(0), 1, device=t.device)], dim=1)
         return emb
 
-
 def cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
-    '''
-    introduce thsi to replace typical linear beta scheduler. Idea is that initial and final additions
-    of noise are much smoother rather than having nosie additions in the forward process that are equally
-    spaced across 'T' diffusion timesteps. --> from Nichol & Dhariwal (2021)
-    '''
     steps = T + 1
-    t = torch.linspace(0, T, steps)
+    t = torch.linspace(0, T, steps, dtype=torch.float32)
     alphas_cum = torch.cos(((t / T) + s) / (1 + s) * (math.pi / 2)) ** 2
     alphas_cum = alphas_cum / alphas_cum[0]
     betas = 1 - (alphas_cum[1:] / alphas_cum[:-1])
     return betas.clamp(min=0.0, max=0.999)
 
 class CustomDiffusion:
-    '''
-    basic forward diffsuion class - only includes the forward process, no decoding
-    uses specified schduler, at the moment the beta scheduler.
-    '''
-    def __init__(self, T: int = 1000, device: str = 'cpu'):
+    def __init__(self, T: int = 1000, device: str = "cpu"):
         self.device = device
         self.T = T
         betas = cosine_beta_schedule(T).to(device)
         alphas = 1.0 - betas
         self.alpha_bar = torch.cumprod(alphas, dim=0)
         self.betas = betas
-
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor):
-        '''
-        forwad step --> return noise sample 'xt' and the added noise contributions
-        '''
-        a_bar = self.alpha_bar.sqrt()[t].view(-1,1,1)
-        m_bar = (1 - self.alpha_bar).sqrt()[t].view(-1,1,1)
-        noise = torch.randn_like(x0)
-        xt = a_bar * x0 + m_bar * noise
-        return xt, noise
+        a_bar = self.alpha_bar.sqrt()[t].view(-1, 1, 1)
+        m_bar = (1 - self.alpha_bar).sqrt()[t].view(-1, 1, 1)
+        eps = torch.randn_like(x0)
+        x_t = a_bar * x0 + m_bar * eps
+        return x_t, eps
 
-
+# ---------------------------- UNet1D ------------------------------
 class UNet1D(nn.Module):
-    '''
-    1D_UNET for time-series data, trrained with the addition of the tiem embeddings.
-    Overview:
-        - Time embedding -> small MLP net
-        -Encoder: downsamples/ extracts feature representations of the noisy data
-        -Bottleneck: latent space - note latent space can be skipped via skip connections
-            -->helps preserve high level features
-        - decoder: upsampling logit extraction
-            -->(ntoe skip connections link encoder layers to decoder layers directly)
-                ie they don't have to pass via the latent space and are jsut directly concatenated with the features
-                of the corresponding decoder level.
-    '''
+    """
+    1D UNet with:
+      • FiLM-style time conditioning at every stage
+      • NEW: multi-scale conditioning from y injected at every stage (additive bias)
+    Inputs: x ∈ R^{B×C_in×L}, where C_in ∈ {1,2,3}
+            convention: channel 0 = x_t, channel 1 = y (if present), channel 2 = self-cond (if present)
+    Output: eps_hat ∈ R^{B×1×L}
+    """
     def __init__(
         self,
         in_ch: int = 1,
@@ -84,81 +63,111 @@ class UNet1D(nn.Module):
         kernel: int = 3,
     ):
         super().__init__()
-        # time-embedding MLP
+        self.in_ch = in_ch
+
+        # time embedding -> [B, base_ch]
         self.time_mlp = nn.Sequential(
             TimeEmbedding(time_dim),
             nn.Linear(time_dim, base_ch),
             nn.ReLU(),
         )
 
-        # encoder
+        # Encoder tower
         self.encoders = nn.ModuleList()
-        chs = [base_ch * (2**i) for i in range(depth)]  # shape [64,128,256]
+        chs = [base_ch * (2 ** i) for i in range(depth)]
         in_c = in_ch
         for out_c in chs:
             self.encoders.append(self._conv_block(in_c, out_c, kernel))
             in_c = out_c
 
-        # bottleneck
+        # Bottleneck
         self.mid = self._conv_block(in_c, in_c, kernel)
 
-        # decoder --> upsample, mirroring encoder with skip connect
+        # Decoder tower
         self.ups = nn.ModuleList()
-        self.dec_convs = nn.ModuleList()
-        prev_ch = chs[-1]  # start at deepest channels
+        self.decoders = nn.ModuleList()
+        prev_ch = chs[-1]
         for skip_ch in reversed(chs):
-            # upsample
-            self.ups.append(nn.Upsample(scale_factor=2, mode='nearest'))
-            # conv after concatenation of prev feature map + skip
-            self.dec_convs.append(self._conv_block(prev_ch + skip_ch, skip_ch, kernel))
+            self.ups.append(nn.Upsample(scale_factor=2, mode="nearest"))
+            self.decoders.append(self._conv_block(prev_ch + skip_ch, skip_ch, kernel))
             prev_ch = skip_ch
 
-        # final conv: combine last feature map with original input
-        self.final = nn.Conv1d(prev_ch + in_ch, in_ch, kernel, padding=kernel//2)
+        # Final head
+        self.final = nn.Conv1d(prev_ch + in_ch, 1, kernel, padding=kernel // 2)
 
-    def _conv_block(self, in_ch: int, out_ch: int, k: int) -> nn.Sequential:
+        # ----- FiLM-style time projections -----
+        self.tproj_enc = nn.ModuleList([nn.Linear(base_ch, c) for c in chs])
+        self.tproj_mid = nn.Linear(base_ch, chs[-1])
+        self.tproj_dec = nn.ModuleList([nn.Linear(base_ch, c) for c in reversed(chs)])
+
+        # ----- NEW: multi-scale conditioning from y (additive bias) -----
+        # if in_ch < 2 (no y provided), these layers will exist but fed zeros
+        self.cond_enc = nn.ModuleList([nn.Conv1d(1, c, kernel_size=1) for c in chs])
+        self.cond_mid = nn.Conv1d(1, chs[-1], kernel_size=1)
+        self.cond_dec = nn.ModuleList([nn.Conv1d(1, c, kernel_size=1) for c in reversed(chs)])
+
+    @staticmethod
+    def _conv_block(in_ch: int, out_ch: int, k: int) -> nn.Sequential:
         pad = k // 2
         return nn.Sequential(
             nn.Conv1d(in_ch, out_ch, k, padding=pad),
             nn.BatchNorm1d(out_ch),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # t embedding
-        t_emb = self.time_mlp(t)[:, :, None]
+    @staticmethod
+    def _add_time(h: torch.Tensor, t_emb: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
+        bias = proj(t_emb)[:, :, None]
+        return h + bias
 
-        # encode
+    def _y_or_zeros(self, x: torch.Tensor) -> torch.Tensor:
+        if self.in_ch >= 2:
+            return x[:, 1:2, :]  # assume channel 1 is y
+        else:
+            return torch.zeros(x.size(0), 1, x.size(-1), device=x.device, dtype=x.dtype)
+
+    def _cond_bias(self, y: torch.Tensor, L: int, layer: nn.Conv1d) -> torch.Tensor:
+        # adaptively pool y to match current length then 1×1 conv to channels
+        yL = F.adaptive_avg_pool1d(y, L)
+        return layer(yL)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        B, C, L0 = x.shape
+        t_emb = self.time_mlp(t)
+
+        y = self._y_or_zeros(x)
+
+        # Encode
         skips = []
         h = x
-        for enc in self.encoders:
-            h = enc(h)
+        for i, enc in enumerate(self.encoders):
+            h = enc(h)  # [B, C_i, L]
+            # inject y bias then time bias
+            h = h + self._cond_bias(y, h.size(-1), self.cond_enc[i])
+            h = self._add_time(h, t_emb, self.tproj_enc[i])
             skips.append(h)
             h = F.avg_pool1d(h, 2, 2)
 
-        # bottleneck
+        # Mid
         h = self.mid(h)
+        h = h + self._cond_bias(y, h.size(-1), self.cond_mid)
+        h = self._add_time(h, t_emb, self.tproj_mid)
 
-        # decode
-        for up, dec_conv, skip in zip(self.ups, self.dec_convs, reversed(skips)):
+        # Decode
+        for i, (up, dec, skip) in enumerate(zip(self.ups, self.decoders, reversed(skips))):
             h = up(h)
-            # fix length mismatch if any
             if h.size(-1) != skip.size(-1):
                 diff = skip.size(-1) - h.size(-1)
-                if diff > 0:
-                    h = F.pad(h, (0, diff))
-                else:
-                    h = h[..., :skip.size(-1)]
-            # concat and conv
+                h = F.pad(h, (0, diff)) if diff > 0 else h[..., :skip.size(-1)]
             h = torch.cat([h, skip], dim=1)
-            h = dec_conv(h)
+            h = dec(h)
+            # inject y bias then time bias
+            h = h + self._cond_bias(y, h.size(-1), self.cond_dec[i])
+            h = self._add_time(h, t_emb, self.tproj_dec[i])
 
-        # final skip with original input
+        # Final skip with original input
         if h.size(-1) != x.size(-1):
             diff = x.size(-1) - h.size(-1)
-            if diff > 0:
-                h = F.pad(h, (0, diff))
-            else:
-                h = h[..., :x.size(-1)]
+            h = F.pad(h, (0, diff)) if diff > 0 else h[..., :x.size(-1)]
         out = self.final(torch.cat([h, x], dim=1))
         return out
