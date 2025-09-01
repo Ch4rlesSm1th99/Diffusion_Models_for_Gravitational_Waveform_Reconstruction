@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, List
 
-from numpy.fft import rfft, irfft, rfftfreq
+from numpy.fft import rfft, irfft
 
 def _mad_std(x: np.ndarray) -> float:
     x64 = np.asarray(x, dtype=np.float64)
@@ -27,7 +27,8 @@ def resolve_h5_path(path: str) -> str:
 
 class NoisyWaveDataset(Dataset):
     def __init__(self, h5_path: str, whiten: bool = False,
-                 sigma_mode: str = "std", sigma_fixed: float = 1.0):
+                 sigma_mode: str = "std", sigma_fixed: float = 1.0,
+                 allow_no_signal: bool = False):
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
         self._signal = None
@@ -36,51 +37,78 @@ class NoisyWaveDataset(Dataset):
         self.sigma_mode = sigma_mode
         self.sigma_fixed = float(sigma_fixed)
         self.fs = None
+        self.N = None
+        self.allow_no_signal = allow_no_signal
 
     def _ensure_open(self):
         if self.h5 is None:
-            self.h5 = h5py.File(self.h5_path, "r", swmr=True)
-            if "signal" not in self.h5 or "noisy" not in self.h5:
-                raise KeyError("HDF5 must contain both 'signal' and 'noisy' datasets.")
-            self._signal = self.h5["signal"]
-            self._noisy  = self.h5["noisy"]
+            try:
+                self.h5 = h5py.File(self.h5_path, "r", swmr=True)
+            except Exception:
+                # graceful fallback if SWMR not supported
+                self.h5 = h5py.File(self.h5_path, "r")
+            if "noisy" not in self.h5:
+                raise KeyError("HDF5 must have 'noisy' dataset.")
+            self._noisy = self.h5["noisy"]
+
+            if "signal" in self.h5:
+                self._signal = self.h5["signal"]
+            elif not self.allow_no_signal:
+                raise KeyError("Missing 'signal' dataset. Set allow_no_signal=True for inference.")
+
+            # length sanity
+            self.N = self._noisy.shape[0]
+            if self._signal is not None and self._signal.shape[0] != self.N:
+                raise ValueError("Mismatched leading dimension between 'signal' and 'noisy'.")
+
             # sampling rate
             attrs = self.h5.attrs
-            fs = float(attrs.get("sampling_rate", 0.0)) or float(1.0 / attrs.get("delta_t", 1.0 / 4096.0))
-            self.fs = fs
+            fs_attr = attrs.get("sampling_rate", 0.0)
+            dt_attr = attrs.get("delta_t", 1.0 / 4096.0)
+            self.fs = float(fs_attr) if float(fs_attr) > 0 else float(1.0 / float(dt_attr))
 
     def __len__(self) -> int:
-        with h5py.File(self.h5_path, "r") as f:
-            return f["signal"].shape[0]
+        if self.N is None:
+            self._ensure_open()
+        return int(self.N)
 
     def _whiten_pair(self, y: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Whiten y AND x using PSD estimated from y (Welch-like via FFT bins)."""
         L = len(y)
-        freqs = rfftfreq(L, 1.0 / self.fs)
-        # simple PSD estimate: average |Y|^2 in small freq bins via Welch replacement is ok here
-        # but to keep dependencies minimal, use a smooth-ish envelope by moving-average in freq domain
-        Y = rfft(y.astype(np.float64))
+        y64 = y.astype(np.float64)
+        y64 = y64 - np.mean(y64)
+        Y = rfft(y64)
         P = np.abs(Y) ** 2
-        # smooth PSD a bit
-        if P.size > 3:
+
+        # cheap smoothing in frequency with small moving average
+        if P.size > 9:
             kernel = np.ones(9, dtype=np.float64) / 9.0
-            P = np.convolve(P, kernel, mode='same')
-        P = np.maximum(P, 1e-24)
+            P = np.convolve(P, kernel, mode="same")
+        P = np.maximum(P, 1e-20)  # slightly looser floor to avoid huge gains
+
         y_w = irfft(Y / np.sqrt(P), n=L)
 
-        X = rfft(x.astype(np.float64))
+        X = rfft((x.astype(np.float64) - np.mean(x, dtype=np.float64)))
         x_w = irfft(X / np.sqrt(P), n=L)
         return y_w.astype(np.float32), x_w.astype(np.float32)
 
     def __getitem__(self, idx: int):
         self._ensure_open()
-        clean_np = np.array(self._signal[idx], dtype=np.float32)
         noisy_np = np.array(self._noisy[idx], dtype=np.float32)
+        if self._signal is not None:
+            clean_np = np.array(self._signal[idx], dtype=np.float32)
+        else:
+            clean_np = np.zeros_like(noisy_np, dtype=np.float32)  # placeholder for inference
+
+        # NaN/Inf guard
+        if not np.isfinite(noisy_np).all():
+            noisy_np = np.nan_to_num(noisy_np, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(clean_np).all():
+            clean_np = np.nan_to_num(clean_np, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.whiten:
             noisy_np, clean_np = self._whiten_pair(noisy_np, clean_np)
 
-        # per-sample sigma from y_for_cond (float64 for numerical stability)
+        # per-sample sigma
         if self.sigma_mode == "std":
             s = float(np.std(noisy_np.astype(np.float64)))
         elif self.sigma_mode == "mad":
@@ -92,12 +120,12 @@ class NoisyWaveDataset(Dataset):
         if not np.isfinite(s) or s <= 0:
             s = 1.0
 
-        clean = torch.from_numpy(clean_np).float().unsqueeze(0)  # [1,L]
-        noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)  # [1,L]
+        clean = torch.from_numpy(clean_np).float().unsqueeze(0)
+        noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)
         sigma = torch.tensor(s, dtype=torch.float32)
-
         length = noisy.shape[-1]
         return clean, noisy, sigma, length
+
 
     def close(self):
         try:
@@ -123,16 +151,16 @@ def pad_collate(
         pad = target - x.shape[-1]
         return F.pad(x, (pad, 0)) if pad > 0 else x
 
-    clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)   # [B,1,L]
-    noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)   # [B,1,L]
+    clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)
+    noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)
     mask_pad  = torch.stack([
         _pad_left(torch.ones_like(x, dtype=torch.float32), Lmax) for x in noisy_list
-    ], dim=0)                                                                  # [B,1,L]
+    ], dim=0)
 
     sigma = torch.stack([
         s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
         for s in sigma_list
-    ], dim=0)                                                                   # [B]
+    ], dim=0)
 
     return clean_pad, noisy_pad, sigma, mask_pad
 
@@ -144,12 +172,23 @@ def make_dataloader(
     num_workers: int = 4,
     prefetch_factor: int = 2,
     persistent_workers: bool = True,
-    pin_memory: bool = True,
+    pin_memory: bool = None,
     whiten: bool = False,
     sigma_mode: str = "std",
     sigma_fixed: float = 1.0,
+    allow_no_signal: bool = False,
 ) -> DataLoader:
-    ds = NoisyWaveDataset(h5_path=h5_path, whiten=whiten, sigma_mode=sigma_mode, sigma_fixed=sigma_fixed)
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    ds = NoisyWaveDataset(
+        h5_path=h5_path,
+        whiten=whiten,
+        sigma_mode=sigma_mode,
+        sigma_fixed=sigma_fixed,
+        allow_no_signal=allow_no_signal,
+    )
+
     loader = DataLoader(
         ds,
         batch_size=batch_size,
