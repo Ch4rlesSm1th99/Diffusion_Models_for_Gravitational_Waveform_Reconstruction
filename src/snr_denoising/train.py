@@ -102,6 +102,7 @@ def train_diffusion(args):
         persistent_workers=True if args.num_workers > 0 else False,
         pin_memory=True,
         whiten=args.whiten,
+        whiten_mode=args.whiten_mode,
         sigma_mode=args.sigma_mode,
         sigma_fixed=args.sigma_fixed,
     )
@@ -123,7 +124,6 @@ def train_diffusion(args):
 
     diffusion = CustomDiffusion(T=args.T, device=device)
 
-    # Optimizer + scheduler (optional)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(loader) * args.epochs
     scheduler = None
@@ -222,7 +222,7 @@ def train_diffusion(args):
                 per_sample = el.sum(dim=[1, 2]) / denom
                 loss = per_sample.mean()
 
-            # romve any bad behaving batches
+            # remove any bad behaving batches
             if not torch.isfinite(loss):
                 pbar.write("[warn] non-finite loss - batch skipped")
                 skipped_batches += 1
@@ -360,6 +360,7 @@ def train_diffusion(args):
             'in_ch': in_ch,
             'conditioning': 'concat_noisy+selfcond',
             'whiten': args.whiten,
+            'whiten_mode': args.whiten_mode,
             'sigma_mode': args.sigma_mode,
         },
         'epoch': args.epochs,
@@ -386,10 +387,6 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers',type=int,   default=4)
     parser.add_argument('--seed',       type=int,   default=42)
 
-    # preprocessing to match inference
-    parser.add_argument('--whiten', action='store_true')
-    parser.add_argument('--sigma_mode', choices=['std','mad','fixed'], default='std')
-    parser.add_argument('--sigma_fixed', type=float, default=1.0)
 
     # guidance & self-conditioning
     parser.add_argument('--p_uncond',   type=float, default=0.2)
@@ -429,9 +426,15 @@ if __name__ == '__main__':
     parser.add_argument('--cosine_decay', action='store_true', help='Enable cosine decay after warmup')
     parser.add_argument('--min_lr_scale', type=float, default=0.1, help='Final LR as fraction of base LR for cosine')
 
-    # (Optional) timestep loss weighting: weight --> (1 - alpha_bar[t])^p i.e --> scheduler
+    # timestep loss weighting: weight --> (1 - alpha_bar[t])^p i.e --> scheduler
     parser.add_argument('--loss_weight_power', type=float, default=0.0,
                         help='0 disables; >0 emphasizes noisier steps')
+
+    parser.add_argument('--whiten', action='store_true')
+    parser.add_argument('--whiten_mode', choices=['train', 'model', 'welch', 'auto'], default='auto',
+                        help='How to whiten training data: use saved per-sample PSDs if available.')
+    parser.add_argument('--sigma_mode', choices=['std', 'mad', 'fixed'], default='std')
+    parser.add_argument('--sigma_fixed', type=float, default=1.0)
 
     args = parser.parse_args()
     args.device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
