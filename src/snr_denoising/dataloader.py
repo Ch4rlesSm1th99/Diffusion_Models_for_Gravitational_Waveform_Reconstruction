@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, List
 
-from numpy.fft import rfft, irfft
+from numpy.fft import rfft, irfft, rfftfreq
 
 def _mad_std(x: np.ndarray) -> float:
     x64 = np.asarray(x, dtype=np.float64)
@@ -27,13 +27,25 @@ def resolve_h5_path(path: str) -> str:
 
 class NoisyWaveDataset(Dataset):
     def __init__(self, h5_path: str, whiten: bool = False,
+                 whiten_mode: str = "auto",
                  sigma_mode: str = "std", sigma_fixed: float = 1.0,
                  allow_no_signal: bool = False):
+        """
+        whiten_mode:
+          - 'train' : basic in-file estimator PSD (FFT power + 9-tap smoothing)
+          - 'model' : use saved per-sample model PSD (datasets 'psd_model' or legacy 'psd')
+          - 'welch' : use saved per-sample Welch PSD (datasets 'psd_welch' + 'psd_welch_freqs')
+          - 'auto'  : prefer welch -> model -> train
+        """
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
         self._signal = None
         self._noisy = None
-        self.whiten = whiten
+        self._psd_model = None          # vlen rfft grid
+        self._psd_welch = None          # vlen arbitrary grid
+        self._psd_welch_freqs = None
+        self.whiten = bool(whiten)
+        self.whiten_mode = str(whiten_mode).lower()
         self.sigma_mode = sigma_mode
         self.sigma_fixed = float(sigma_fixed)
         self.fs = None
@@ -45,7 +57,6 @@ class NoisyWaveDataset(Dataset):
             try:
                 self.h5 = h5py.File(self.h5_path, "r", swmr=True)
             except Exception:
-                # graceful fallback if SWMR not supported
                 self.h5 = h5py.File(self.h5_path, "r")
             if "noisy" not in self.h5:
                 raise KeyError("HDF5 must have 'noisy' dataset.")
@@ -55,6 +66,11 @@ class NoisyWaveDataset(Dataset):
                 self._signal = self.h5["signal"]
             elif not self.allow_no_signal:
                 raise KeyError("Missing 'signal' dataset. Set allow_no_signal=True for inference.")
+
+            # optional PSDs
+            self._psd_model = self.h5.get("psd_model", self.h5.get("psd", None))
+            self._psd_welch = self.h5.get("psd_welch", None)
+            self._psd_welch_freqs = self.h5.get("psd_welch_freqs", None)
 
             # length sanity
             self.N = self._noisy.shape[0]
@@ -72,24 +88,53 @@ class NoisyWaveDataset(Dataset):
             self._ensure_open()
         return int(self.N)
 
-    def _whiten_pair(self, y: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    # whitening helpers
+    @staticmethod
+    def _whiten_train_like(y: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         L = len(y)
-        y64 = y.astype(np.float64)
-        y64 = y64 - np.mean(y64)
+        y64 = y.astype(np.float64) - np.mean(y, dtype=np.float64)
         Y = rfft(y64)
         P = np.abs(Y) ** 2
-
-        # cheap smoothing in frequency with small moving average
         if P.size > 9:
             kernel = np.ones(9, dtype=np.float64) / 9.0
             P = np.convolve(P, kernel, mode="same")
-        P = np.maximum(P, 1e-20)  # slightly looser floor to avoid huge gains
-
+        P = np.maximum(P, 1e-20)
         y_w = irfft(Y / np.sqrt(P), n=L)
 
         X = rfft((x.astype(np.float64) - np.mean(x, dtype=np.float64)))
         x_w = irfft(X / np.sqrt(P), n=L)
         return y_w.astype(np.float32), x_w.astype(np.float32)
+
+    @staticmethod
+    def _interp_psd_to_length(P: np.ndarray, L_src: int, L_tgt: int, fs: float) -> np.ndarray:
+        """If model PSD length != rfft length for L_tgt, interpolate over frequency."""
+        if L_src == (L_tgt // 2 + 1):
+            return P.astype(np.float64)
+        f_src = rfftfreq(L_src * 2 - 2, 1.0 / fs)  # invert rfft length back to time length
+        f_tgt = rfftfreq(L_tgt, 1.0 / fs)
+        return np.interp(f_tgt, f_src, P, left=P[0], right=P[-1]).astype(np.float64)
+
+    def _whiten_with_model_psd(self, y: np.ndarray, x: np.ndarray, P_model: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        L = len(y)
+        # Interp if needed
+        P = self._interp_psd_to_length(np.asarray(P_model, dtype=np.float64), len(P_model), L, self.fs)
+        Y = rfft(y.astype(np.float64))
+        X = rfft(x.astype(np.float64))
+        y_w = irfft(Y / np.sqrt(P + 1e-20), n=L)
+        x_w = irfft(X / np.sqrt(P + 1e-20), n=L)
+        return y_w.astype(np.float32), x_w.astype(np.float32)
+
+    def _whiten_with_welch(self, y: np.ndarray, x: np.ndarray, f_w: np.ndarray, P_w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        L = len(y)
+        f_tgt = rfftfreq(L, 1.0 / self.fs)
+        P = np.interp(f_tgt, np.asarray(f_w, dtype=np.float64), np.asarray(P_w, dtype=np.float64),
+                      left=P_w[0], right=P_w[-1])
+        Y = rfft(y.astype(np.float64))
+        X = rfft(x.astype(np.float64))
+        y_w = irfft(Y / np.sqrt(P + 1e-20), n=L)
+        x_w = irfft(X / np.sqrt(P + 1e-20), n=L)
+        return y_w.astype(np.float32), x_w.astype(np.float32)
+
 
     def __getitem__(self, idx: int):
         self._ensure_open()
@@ -106,7 +151,27 @@ class NoisyWaveDataset(Dataset):
             clean_np = np.nan_to_num(clean_np, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.whiten:
-            noisy_np, clean_np = self._whiten_pair(noisy_np, clean_np)
+            mode = self.whiten_mode
+            used = None
+            if mode == "auto":
+                if (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
+                    fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
+                    Pw = np.array(self._psd_welch[idx], dtype=np.float64)
+                    noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw); used = "welch"
+                elif self._psd_model is not None:
+                    Pm = np.array(self._psd_model[idx], dtype=np.float64)
+                    noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm); used = "model"
+                else:
+                    noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np); used = "train"
+            elif mode == "welch" and (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
+                fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
+                Pw = np.array(self._psd_welch[idx], dtype=np.float64)
+                noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw); used = "welch"
+            elif mode == "model" and (self._psd_model is not None):
+                Pm = np.array(self._psd_model[idx], dtype=np.float64)
+                noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm); used = "model"
+            else:
+                noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np); used = "train"
 
         # per-sample sigma
         if self.sigma_mode == "std":
@@ -136,6 +201,9 @@ class NoisyWaveDataset(Dataset):
         self.h5 = None
         self._signal = None
         self._noisy = None
+        self._psd_model = None
+        self._psd_welch = None
+        self._psd_welch_freqs = None
 
     def __del__(self):
         self.close()
@@ -174,6 +242,7 @@ def make_dataloader(
     persistent_workers: bool = True,
     pin_memory: bool = None,
     whiten: bool = False,
+    whiten_mode: str = "auto",
     sigma_mode: str = "std",
     sigma_fixed: float = 1.0,
     allow_no_signal: bool = False,
@@ -184,6 +253,7 @@ def make_dataloader(
     ds = NoisyWaveDataset(
         h5_path=h5_path,
         whiten=whiten,
+        whiten_mode=whiten_mode,
         sigma_mode=sigma_mode,
         sigma_fixed=sigma_fixed,
         allow_no_signal=allow_no_signal,
