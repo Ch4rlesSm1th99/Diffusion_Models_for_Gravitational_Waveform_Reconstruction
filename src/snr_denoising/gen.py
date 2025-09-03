@@ -13,7 +13,7 @@ import tempfile
 
 
 """
-gen.py — Generate time-domain GW waveforms with LIGO-like noise, and write HDF5 datasets with separate properties.
+gen.py - Generate time-domain GW waveforms with LIGO-like noise, and write HDF5 datasets with separate properties.
 
 Modes:
   - fixed : repeat one wave config for the entire dataset
@@ -24,8 +24,15 @@ Output:
   HDF5 containing variable-length signal/noise/noisy, per-sample times
   (seconds-relative with t=0 at merger), metadata and gen mode.
 
-This version has **no fallbacks**. If a combo fails (e.g., SEOBNRv4 at given f_lower), it is skipped — or,
+This version has **no fallbacks**. If a combo fails, it is skipped - or,
 with --require-complete-grid, the run aborts and tells user to adjust --f-lower (or ranges).
+
+Intriduced new:
+  1. Optional per-sample PSD saving (model PSD and/or Welch PSD).
+  2. Datasets:
+      - 'psd_model' (and alias 'psd'): model PSD on rfft grid (length N//2+1)
+      - 'psd_welch' + 'psd_welch_freqs': Welch estimate (its own frequency grid)
+  3. PSD configuration saved in file attributes.
 """
 
 try:
@@ -144,7 +151,11 @@ def collect_samples(
     save_psd=False,
     psd_preview=0,
     psd_preview_dir=None,
-    use_tqdm=True
+    use_tqdm=True,
+    psd_source='both',         # {'model','welch','both'}
+    psd_nperseg=4096,
+    psd_noverlap=None,
+    psd_window='hann',
 ):
     """
     Generate samples from a list of specs (kwargs for generate_ligo_waveform).
@@ -165,7 +176,13 @@ def collect_samples(
         'psd_len','psd_df','psd_f_lower'
     ]}
     detectors = []
-    full_psd_list = [] if save_psd else None
+
+    # PSD containers
+    want_model = bool(save_psd and psd_source in ('model', 'both'))
+    want_welch = bool(save_psd and psd_source in ('welch', 'both'))
+    full_psd_list   = [] if want_model else None
+    welch_psd_list  = [] if want_welch else None
+    welch_freqs_list= [] if want_welch else None
 
     iterable = _maybe_tqdm(range(len(sample_specs)), total=len(sample_specs),
                            desc="Generating samples", use_tqdm=use_tqdm)
@@ -218,7 +235,7 @@ def collect_samples(
         noisy_list.append(noz_np)
         t_list.append(res['times'])
 
-        # PSD metadata
+        # PSD metadata (for model PSD grid reconstruction)
         N = len(sig_np)
         delta_t = 1.0 / sr
         df = 1.0 / (N * delta_t)
@@ -227,19 +244,41 @@ def collect_samples(
         meta['psd_f_lower'].append(f_lower)
         detectors.append(detector.encode('utf-8'))
 
-        if full_psd_list is not None:
+        # MODEL PSD (the one used to generate colored noise)
+        if want_model:
             psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy().astype(np.float32)
             full_psd_list.append(psd_vec)
+
+        # WELCH PSD (empirical per-sample)
+        if want_welch:
+            try:
+                from scipy.signal import welch
+                nperseg = min(int(psd_nperseg), N)
+                noverlap = nperseg // 2 if psd_noverlap is None else int(psd_noverlap)
+                f_w, P_w = welch(noi_np, fs=sr, nperseg=nperseg, noverlap=noverlap,
+                                 window=psd_window, detrend=False, scaling='density')
+                welch_freqs_list.append(f_w.astype(np.float32))
+                welch_psd_list.append(P_w.astype(np.float32))
+            except Exception as e:
+                # if SciPy isn't available, skip Welch PSD for this sample
+                if not _HAS_TQDM or not use_tqdm:
+                    print(f"[warn] Welch PSD failed at idx={i}: {e}")
 
         if psd_preview and (len(sig_list) <= psd_preview) and psd_preview_dir:
             psd_vec = aLIGOZeroDetHighPower(N // 2 + 1, df, f_lower).numpy()
             f = np.arange(psd_vec.shape[0]) * df
             asd = np.sqrt(psd_vec + 1e-30)
             plt.figure(figsize=(6, 4))
-            plt.loglog(f[1:], asd[1:])
+            plt.loglog(f[1:], asd[1:], label='model ASD')
+            if want_welch and len(welch_freqs_list) > 0 and len(welch_psd_list) > 0:
+                try:
+                    plt.loglog(welch_freqs_list[-1][1:], np.sqrt(welch_psd_list[-1][1:] + 1e-30), alpha=0.7, label='welch ASD')
+                except Exception:
+                    pass
             plt.xlabel("Frequency (Hz)"); plt.ylabel("ASD (1/√Hz)")
-            plt.title(f"PSD (ASD) — {detector}, f_low={f_lower:g} Hz, N={N}, Δt={delta_t:.6g}")
+            plt.title(f"PSD (ASD) {detector}, f_low={f_lower:g} Hz, N={N}, Δt={delta_t:.6g}")
             plt.grid(True, which='both', ls=':')
+            plt.legend(frameon=False)
             os.makedirs(psd_preview_dir, exist_ok=True)
             plt.savefig(os.path.join(psd_preview_dir, f"psd_{len(sig_list):05d}.png"), dpi=150, bbox_inches='tight')
             plt.close()
@@ -263,7 +302,7 @@ def collect_samples(
         meta['q'].append(q)
         meta['chirp_mass'].append(Mchirp)
 
-    return sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list
+    return sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list, welch_psd_list, welch_freqs_list
 
 
 def finalize_and_write(
@@ -272,7 +311,10 @@ def finalize_and_write(
     sampling_rate,
     attrs_extra=None,
     detectors_bytes=None,
-    full_psd_list=None
+    full_psd_list=None,         # model PSD per-sample (rfft grid)
+    welch_psd_list=None,        # Welch PSD per-sample
+    welch_freqs_list=None,      # Welch freqs per-sample
+    psd_params=None,            # dict with keys: source, nperseg, noverlap, window
 ):
     """Write HDF5 with variable-length datasets (no padding), and times centered at merger (t=0 at abs(signal) peak)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -287,7 +329,6 @@ def finalize_and_write(
                 a_np = a_np.reshape(-1)
             obj[i] = a_np
         return obj
-
 
     sig_obj   = _to_vlen_object(sig_list,   np.float32)
     noise_obj = _to_vlen_object(noise_list, np.float32)
@@ -325,16 +366,39 @@ def finalize_and_write(
             f.create_dataset('psd_detector',
                              data=np.array(detectors_bytes, dtype=object),
                              dtype=vlen_str)
-        # optional full PSD vectors
+
+        # PSD datasets
+        # (Option A) Model PSD per sample on implicit rfft grid
         if full_psd_list is not None:
             psd_obj = _to_vlen_object(full_psd_list, np.float32)
-            f.create_dataset('psd', data=psd_obj, dtype=vlen_f32)
+            f.create_dataset('psd',       data=psd_obj, dtype=vlen_f32)     # back-compat alias 'psd'
+            f.create_dataset('psd_model', data=psd_obj, dtype=vlen_f32)
+
+        # (Option B) Welch PSD per sample with explicit frequency axis
+        if (welch_psd_list is not None) and (welch_freqs_list is not None):
+            psd_w_obj  = _to_vlen_object(welch_psd_list,  np.float32)
+            freq_w_obj = _to_vlen_object(welch_freqs_list, np.float32)
+            f.create_dataset('psd_welch',       data=psd_w_obj,  dtype=vlen_f32)
+            f.create_dataset('psd_welch_freqs', data=freq_w_obj, dtype=vlen_f32)
 
         # attrs
         f.attrs['padding']        = 'none'
         f.attrs['sampling_rate']  = float(sampling_rate)
         f.attrs['delta_t']        = float(delta_t)
         f.attrs['time_axis']      = 'seconds-rel-peak'  # t=0 at merger (abs(signal) peak)
+
+        # PSD bookkeeping
+        f.attrs['psd_saved'] = bool(
+            (full_psd_list is not None and len(full_psd_list) > 0) or
+            (welch_psd_list is not None and len(welch_psd_list) > 0)
+        )
+        f.attrs['psd_model_kind'] = 'aLIGOZeroDetHighPower' if (full_psd_list is not None) else ''
+        if psd_params is not None:
+            f.attrs['psd_source']      = str(psd_params.get('source', 'both'))
+            f.attrs['psd_welch_nperseg'] = int(psd_params.get('nperseg', -1))
+            f.attrs['psd_welch_noverlap'] = int(psd_params.get('noverlap', -1) if psd_params.get('noverlap') is not None else -1)
+            f.attrs['psd_welch_window']   = str(psd_params.get('window', ''))
+
         if attrs_extra:
             for k, v in attrs_extra.items():
                 f.attrs[k] = v
@@ -351,8 +415,6 @@ def finalize_and_write(
     print(f"saved {len(sig_list)} samples "
           f"(padding=none, time_axis=seconds-rel-peak; t=0 at |signal| peak) "
           f"--> {output_path}")
-
-
 
 
 if __name__ == "__main__":
@@ -421,7 +483,6 @@ if __name__ == "__main__":
     g_grid.add_argument('--require-complete-grid', action='store_true',
                         help='If set, raise an error if any (m1,m2) pair fails during the probe step (tip: try adjusting --f-lower).')
 
-
     # MISC / TUNABLES
     g_misc = parser.add_argument_group("Misc")
     g_misc.add_argument('--plot', action='store_true',
@@ -438,7 +499,15 @@ if __name__ == "__main__":
     # PSD options
     g_psd = parser.add_argument_group("PSD options")
     g_psd.add_argument('--save-psd', action='store_true',
-                       help='Store the full PSD vector per sample in the HDF5 (variable-length).')
+                       help='Store PSD(s) per sample in the HDF5.')
+    g_psd.add_argument('--psd-source', choices=['model', 'welch', 'both'], default='both',
+                       help='Which PSD(s) to save per sample.')
+    g_psd.add_argument('--psd-nperseg', type=int, default=4096,
+                       help='Welch nperseg (clipped to <= length).')
+    g_psd.add_argument('--psd-noverlap', type=int, default=None,
+                       help='Welch noverlap (default: nperseg//2).')
+    g_psd.add_argument('--psd-window', type=str, default='hann',
+                       help='Welch window.')
     g_psd.add_argument('--psd-preview', type=int, default=0,
                        help='If > 0, save this many PSD ASD plots to disk.')
     g_psd.add_argument('--psd-preview-dir', type=str, default=None,
@@ -459,6 +528,14 @@ if __name__ == "__main__":
         base_dir = os.path.dirname(args.output_path)
         args.psd_preview_dir = os.path.join(base_dir, "psd_plots")
 
+    # PSD param dict for file attrs
+    _psd_params = dict(
+        source=args.psd_source,
+        nperseg=args.psd_nperseg,
+        noverlap=args.psd_noverlap,
+        window=args.psd_window,
+    )
+
     if args.mode == 'fixed':
         sample_specs = [
             dict(
@@ -469,14 +546,18 @@ if __name__ == "__main__":
             )
             for _ in range(args.num_samples)
         ]
-        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list, welch_psd_list, welch_freqs_list = collect_samples(
             sample_specs,
             plot_flag=args.plot,
             progress_every=args.progress_every,
             save_psd=args.save_psd,
             psd_preview=args.psd_preview,
             psd_preview_dir=args.psd_preview_dir,
-            use_tqdm=args.use_tqdm
+            use_tqdm=args.use_tqdm,
+            psd_source=args.psd_source,
+            psd_nperseg=args.psd_nperseg,
+            psd_noverlap=args.psd_noverlap,
+            psd_window=args.psd_window,
         )
 
         finalize_and_write(
@@ -491,7 +572,10 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list
+            full_psd_list=full_psd_list,
+            welch_psd_list=welch_psd_list,
+            welch_freqs_list=welch_freqs_list,
+            psd_params=_psd_params,
         )
 
     elif args.mode == 'random':
@@ -532,14 +616,18 @@ if __name__ == "__main__":
                 f"please narrow ranges or adjust --f-lower."
             )
 
-        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list, welch_psd_list, welch_freqs_list = collect_samples(
             sample_specs,
             plot_flag=args.plot,
             progress_every=args.progress_every,
             save_psd=args.save_psd,
             psd_preview=args.psd_preview,
             psd_preview_dir=args.psd_preview_dir,
-            use_tqdm=args.use_tqdm
+            use_tqdm=args.use_tqdm,
+            psd_source=args.psd_source,
+            psd_nperseg=args.psd_nperseg,
+            psd_noverlap=args.psd_noverlap,
+            psd_window=args.psd_window,
         )
 
         finalize_and_write(
@@ -554,7 +642,10 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list
+            full_psd_list=full_psd_list,
+            welch_psd_list=welch_psd_list,
+            welch_freqs_list=welch_freqs_list,
+            psd_params=_psd_params,
         )
 
     elif args.mode == 'grid':
@@ -675,14 +766,18 @@ if __name__ == "__main__":
         if args.shuffle:
             rng.shuffle(sample_specs)
 
-        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list = collect_samples(
+        sig_list, noise_list, noisy_list, t_list, meta, detectors, full_psd_list, welch_psd_list, welch_freqs_list = collect_samples(
             sample_specs,
             plot_flag=args.plot,
             progress_every=args.progress_every,
             save_psd=args.save_psd,
             psd_preview=args.psd_preview,
             psd_preview_dir=args.psd_preview_dir,
-            use_tqdm=args.use_tqdm
+            use_tqdm=args.use_tqdm,
+            psd_source=args.psd_source,
+            psd_nperseg=args.psd_nperseg,
+            psd_noverlap=args.psd_noverlap,
+            psd_window=args.psd_window,
         )
 
         succ = len(sig_list)
@@ -696,6 +791,10 @@ if __name__ == "__main__":
                 detectors = detectors[:keep]
             if full_psd_list is not None:
                 full_psd_list = full_psd_list[:keep]
+            if welch_psd_list is not None:
+                welch_psd_list = welch_psd_list[:keep]
+            if welch_freqs_list is not None:
+                welch_freqs_list = welch_freqs_list[:keep]
         else:
             print(f"[WARNING] only generated {succ}/{args.num_samples} after filtering failures. "
                   f"Try adjusting --overgen-factor or re-running.")
@@ -721,5 +820,8 @@ if __name__ == "__main__":
                 'config_args': args_json
             },
             detectors_bytes=detectors,
-            full_psd_list=full_psd_list
+            full_psd_list=full_psd_list,
+            welch_psd_list=welch_psd_list,
+            welch_freqs_list=welch_freqs_list,
+            psd_params=_psd_params,
         )
