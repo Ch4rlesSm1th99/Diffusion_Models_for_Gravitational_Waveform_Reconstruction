@@ -109,6 +109,22 @@ def train_diffusion(args):
 
     print(f"[train] Dataset size: {len(loader.dataset)}")
     print(f"[train] Batches/epoch: {len(loader)} , device={args.device} , AMP={args.amp}")
+    try:
+        ds = loader.dataset
+        if hasattr(ds, "_ensure_open"):
+            ds._ensure_open()
+        h5p = getattr(ds, "h5_path", None)
+        fs  = getattr(ds, "fs", None)
+        h5  = getattr(ds, "h5", None)
+        print(f"[train] HDF5 path: {h5p}")
+        print(f"[train] sampling_rate (fs): {fs}")
+        print(f"[train] training whitening: {ds.whiten} , whiten_mode(req)={ds.whiten_mode} , sigma_mode={ds.sigma_mode}")
+        if h5 is not None:
+            ha = h5.attrs
+            print(f"[train] H5 attrs -> time_axis={ha.get('time_axis','?')} padding={ha.get('padding','?')}")
+            print(f"[train] PSD saved? {bool(ha.get('psd_saved', False))} , model_kind={ha.get('psd_model_kind','')}")
+    except Exception as e:
+        print(f"[train] dataset banner failed: {e}")
 
     device = torch.device(args.device)
     in_ch = 3
@@ -143,10 +159,20 @@ def train_diffusion(args):
             p.requires_grad_(False)
 
     # AMP
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     run_start = time.time()
     global_step = 0
+
+    # control: run deep first-batch probe only on epoch 1 (and optionally every N epochs)
+    def _do_debug_this_epoch(epoch_idx: int) -> bool:
+        if not args.debug_first:
+            return False
+        if epoch_idx == 1:
+            return True
+        if args.debug_first_every and (epoch_idx % args.debug_first_every == 0):
+            return True
+        return False
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -155,15 +181,20 @@ def train_diffusion(args):
         batch_losses = []
         skipped_batches = 0
 
+        # epoch-level knobs
+        t_min_epoch = int(max(0, min(args.T - 1, int(args.t_min_frac * args.T))))
+        p_uncond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_uncond
+        p_selfcond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_selfcond
+        print(f"[train] Epoch {epoch}/{args.epochs} :: p_uncond_eff={p_uncond_eff:.2f} "
+              f"p_selfcond_eff={p_selfcond_eff:.2f} , t_min={t_min_epoch}")
+
         pbar = tqdm(
             loader, total=len(loader),
             desc=f"Epoch {epoch}/{args.epochs}",
             unit="batch", dynamic_ncols=True, leave=True, mininterval=0.1,
         )
 
-        # guidance/self-cond (can be forced off for early epochs)
-        p_uncond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_uncond
-        p_selfcond_eff = 0.0 if epoch <= args.force_cond_epochs else args.p_selfcond
+        printed_debug_this_epoch = False
 
         for i, (clean_raw, noisy_raw, sigma, mask) in enumerate(pbar):
             clean_raw = clean_raw.to(device, non_blocking=True).float()
@@ -182,10 +213,10 @@ def train_diffusion(args):
                 cond_norm = cond_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
 
             # biased timestep sampling: t in [t_min, T-1]
-            t_min = int(max(0, min(args.T - 1, int(args.t_min_frac * args.T))))
+            t_min = t_min_epoch
             t = torch.randint(t_min, args.T, (bsz,), device=device, dtype=torch.long)
 
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with torch.amp.autocast('cuda', enabled=args.amp):
                 x_t, eps = diffusion.q_sample(clean_norm, t)
 
                 if args.clamp_inputs > 0:
@@ -313,30 +344,85 @@ def train_diffusion(args):
                             "cond_delta_rms": delta_rms,
                         })
 
-            if i == 0 and args.debug_first:
-                def _stats(x):
+            # ---- rate limited batch probe: once on epoch 1, optionally every N epochs
+            if (i == 0) and (not printed_debug_this_epoch) and _do_debug_this_epoch(epoch):
+                printed_debug_this_epoch = True
+
+                def _stats(x: torch.Tensor):
                     return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
-                ct_min, ct_max, ct_mean, ct_std = _stats(x_t)
+
                 cn_min, cn_max, cn_mean, cn_std = _stats(clean_norm)
                 yn_min, yn_max, yn_mean, yn_std = _stats(cond_norm)
+                ct_min, ct_max, ct_mean, ct_std = _stats(x_t)
                 eh_min, eh_max, eh_mean, eh_std = _stats(eps_hat)
+
+                print(f"[DEBUG] sigma[min/mean/max]={sigma.min().item():.3e}/{sigma.mean().item():.3e}/{sigma.max().item():.3e}")
                 print(f"[DEBUG] clean_norm: min={cn_min:.3e}, max={cn_max:.3e}, mean={cn_mean:.3e}, std={cn_std:.3e}")
                 print(f"[DEBUG] cond_norm:  min={yn_min:.3e}, max={yn_max:.3e}, mean={yn_mean:.3e}, std={yn_std:.3e}")
                 print(f"[DEBUG] x_t:        min={ct_min:.3e}, max={ct_max:.3e}, mean={ct_mean:.3e}, std={ct_std:.3e}")
                 print(f"[DEBUG] eps_hat:    min={eh_min:.3e}, max={eh_max:.3e}, mean={eh_mean:.3e}, std={eh_std:.3e}")
+
                 ab = diffusion.alpha_bar[t].view(-1, 1, 1)
                 x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
                 x0_hat = x0_hat_norm * sigma.view(-1, 1, 1)
+
                 x0_min, x0_max, x0_mean, x0_std = _stats(x0_hat)
                 print(f"[DEBUG] recon_unnorm: min={x0_min:.3e}, max={x0_max:.3e}, mean={x0_mean:.3e}, std={x0_std:.3e}")
+
+                def _corr_masked(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
+                    # a,b: [1,1,L], m: [1,1,L] with 1s on valid region
+                    a1 = a[m > 0.5].reshape(-1)
+                    b1 = b[m > 0.5].reshape(-1)
+                    if a1.numel() < 2 or b1.numel() < 2:
+                        return float('nan')
+                    a1 = a1 - a1.mean()
+                    b1 = b1 - b1.mean()
+                    den = (a1.pow(2).sum().sqrt() * b1.pow(2).sum().sqrt() + 1e-12)
+                    return float((a1 * b1).sum() / den)
+
+                m0 = (mask[0:1]).float()  # [1,1,L] valid=1, pad=0
+
+                # correlations in normalized (whitened, sigma-normalized) domain
+                corr_x0n = _corr_masked(x0_hat_norm[0:1], clean_norm[0:1], m0)
+                # correlations in whitened (but unnormalized-by-sigma) domain
+                corr_x0w = _corr_masked(x0_hat[0:1], clean_raw[0:1], m0)
+
+                # masked MSE (both domains)
+                mse_x0n = (((x0_hat_norm - clean_norm) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
+                mse_x0w = (((x0_hat - clean_raw) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
+
+                valid_frac = float(m0.mean().item())
+                print(f"[DEBUG] valid_frac={valid_frac:.3f} , "
+                      f"corr_masked(x0_norm, clean_norm)={corr_x0n:.3f} "
+                      f"corr_masked(x0, clean)={corr_x0w:.3f} , "
+                      f"MSE_masked_norm={mse_x0n.item():.3e} , MSE_masked_white={mse_x0w.item():.3e}")
+
+                # quick correlations on sample 0
+                try:
+                    corr_eps = _corr_torch(eps_hat[0], eps[0]).item()
+                    print(f"[DEBUG] corr(eps_hat, eps)={corr_eps:.3f}")
+                except Exception:
+                    pass
+
+                # tiny npy dump (first epoch only)
+                if epoch == 1:
+                    try:
+                        dbg_dir = os.path.join(out_dir, "debug_batch0")
+                        os.makedirs(dbg_dir, exist_ok=True)
+                        np.save(os.path.join(dbg_dir, "clean_raw.npy"), clean_raw[0].detach().cpu().numpy().ravel())
+                        np.save(os.path.join(dbg_dir, "cond_norm.npy"), cond_norm[0].detach().cpu().numpy().ravel())
+                        np.save(os.path.join(dbg_dir, "x0_hat.npy"), x0_hat[0].detach().cpu().numpy().ravel())
+                        print(f"[DEBUG] wrote debug npys -> {dbg_dir}")
+                    except Exception as e:
+                        print("[DEBUG] npy-dump skipped:", e)
 
         avg_loss_per_sample = sum_loss_weighted / max(1, sum_weight)
         avg_loss_per_batch = float(np.mean(batch_losses)) if batch_losses else float("nan")
         med_loss_per_batch = float(np.median(batch_losses)) if batch_losses else float("nan")
         print(
             f"Epoch {epoch}/{args.epochs} - "
-            f"Avg(per-sample)={avg_loss_per_sample:.6f} | "
-            f"Mean(per-batch)={avg_loss_per_batch:.6f} | "
+            f"Avg(per-sample)={avg_loss_per_sample:.6f} "
+            f"Mean(per-batch)={avg_loss_per_batch:.6f} "
             f"Median(per-batch)={med_loss_per_batch:.6f}"
         )
         _log_jsonl(args.log_jsonl, {
@@ -387,7 +473,6 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers',type=int,   default=4)
     parser.add_argument('--seed',       type=int,   default=42)
 
-
     # guidance & self-conditioning
     parser.add_argument('--p_uncond',   type=float, default=0.2)
     parser.add_argument('--p_selfcond', type=float, default=0.5)
@@ -407,11 +492,14 @@ if __name__ == '__main__':
     parser.add_argument('--skip_loss_threshold', type=float, default=50.0)
 
     # logging / probes
-    parser.add_argument('--debug_first', action='store_true')
+    parser.add_argument('--debug_first', action='store_true',
+                        help='Print deep stats for the first batch (epoch 1 only by default).')
+    parser.add_argument('--debug_first_every', type=int, default=0,
+                        help='If >0, also run the deep first-batch probe every N epochs (rate-limited).')
     parser.add_argument('--log-jsonl', type=str, default=None,
                         help='Append per-batch/probe metrics to this JSONL file')
     parser.add_argument('--probe-cond', action='store_true',
-                        help='Enable conditioning probe (cond on vs off) during training')
+                        help='Enable conditioning probe (cond on vs off) during training (JSONL only)')
     parser.add_argument('--probe-t', type=int, nargs='*',
                         default=[24, 50, 200, 500, 800],
                         help='Timesteps to probe at if --probe-cond is set')
