@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, List
-
 from numpy.fft import rfft, irfft, rfftfreq
 
 def _mad_std(x: np.ndarray) -> float:
@@ -24,26 +23,27 @@ def resolve_h5_path(path: str) -> str:
         raise FileNotFoundError(f"HDF5 path not found: {path}")
     return path
 
-
 class NoisyWaveDataset(Dataset):
     def __init__(self, h5_path: str, whiten: bool = False,
                  whiten_mode: str = "auto",
                  sigma_mode: str = "std", sigma_fixed: float = 1.0,
-                 allow_no_signal: bool = False):
+                 allow_no_signal: bool = False,
+                 include_metadata: bool = True,
+                 mass_scale: float = 80.0):
         """
-        whiten_mode:
-          - 'train' : basic in-file estimator PSD (FFT power + 9-tap smoothing)
-          - 'model' : use saved per-sample model PSD (datasets 'psd_model' or legacy 'psd')
-          - 'welch' : use saved per-sample Welch PSD (datasets 'psd_welch' + 'psd_welch_freqs')
-          - 'auto'  : prefer welch -> model -> train
+        Returns (clean, noisy, sigma, length, meta_bc)
+
+        meta_bc: (4, L) broadcast of [m1/mass_scale, m2/mass_scale, spin1z, spin2z].
+        If meta datasets are missing or include_metadata=False, zeros are returned.
         """
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
         self._signal = None
         self._noisy = None
-        self._psd_model = None          # vlen rfft grid
-        self._psd_welch = None          # vlen arbitrary grid
+        self._psd_model = None
+        self._psd_welch = None
         self._psd_welch_freqs = None
+
         self.whiten = bool(whiten)
         self.whiten_mode = str(whiten_mode).lower()
         self.sigma_mode = sigma_mode
@@ -52,16 +52,22 @@ class NoisyWaveDataset(Dataset):
         self.N = None
         self.allow_no_signal = allow_no_signal
 
+        # metadata controls
+        self.include_metadata = bool(include_metadata)
+        self.mass_scale = float(mass_scale)
+        self._m1 = self._m2 = self._s1 = self._s2 = None
+
     def _ensure_open(self):
         if self.h5 is None:
             try:
                 self.h5 = h5py.File(self.h5_path, "r", swmr=True)
             except Exception:
                 self.h5 = h5py.File(self.h5_path, "r")
+
+            # datasets
             if "noisy" not in self.h5:
                 raise KeyError("HDF5 must have 'noisy' dataset.")
             self._noisy = self.h5["noisy"]
-
             if "signal" in self.h5:
                 self._signal = self.h5["signal"]
             elif not self.allow_no_signal:
@@ -72,7 +78,13 @@ class NoisyWaveDataset(Dataset):
             self._psd_welch = self.h5.get("psd_welch", None)
             self._psd_welch_freqs = self.h5.get("psd_welch_freqs", None)
 
-            # length sanity
+            # optional metadata
+            self._m1 = self.h5.get("mass1", None)
+            self._m2 = self.h5.get("mass2", None)
+            self._s1 = self.h5.get("spin1z", None)
+            self._s2 = self.h5.get("spin2z", None)
+
+            # length checks
             self.N = self._noisy.shape[0]
             if self._signal is not None and self._signal.shape[0] != self.N:
                 raise ValueError("Mismatched leading dimension between 'signal' and 'noisy'.")
@@ -107,16 +119,14 @@ class NoisyWaveDataset(Dataset):
 
     @staticmethod
     def _interp_psd_to_length(P: np.ndarray, L_src: int, L_tgt: int, fs: float) -> np.ndarray:
-        """If model PSD length != rfft length for L_tgt, interpolate over frequency."""
         if L_src == (L_tgt // 2 + 1):
             return P.astype(np.float64)
-        f_src = rfftfreq(L_src * 2 - 2, 1.0 / fs)  # invert rfft length back to time length
+        f_src = rfftfreq(L_src * 2 - 2, 1.0 / fs)
         f_tgt = rfftfreq(L_tgt, 1.0 / fs)
         return np.interp(f_tgt, f_src, P, left=P[0], right=P[-1]).astype(np.float64)
 
     def _whiten_with_model_psd(self, y: np.ndarray, x: np.ndarray, P_model: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         L = len(y)
-        # Interp if needed
         P = self._interp_psd_to_length(np.asarray(P_model, dtype=np.float64), len(P_model), L, self.fs)
         Y = rfft(y.astype(np.float64))
         X = rfft(x.astype(np.float64))
@@ -135,14 +145,13 @@ class NoisyWaveDataset(Dataset):
         x_w = irfft(X / np.sqrt(P + 1e-20), n=L)
         return y_w.astype(np.float32), x_w.astype(np.float32)
 
-
     def __getitem__(self, idx: int):
         self._ensure_open()
         noisy_np = np.array(self._noisy[idx], dtype=np.float32)
         if self._signal is not None:
             clean_np = np.array(self._signal[idx], dtype=np.float32)
         else:
-            clean_np = np.zeros_like(noisy_np, dtype=np.float32)  # placeholder for inference
+            clean_np = np.zeros_like(noisy_np, dtype=np.float32)
 
         # NaN/Inf guard
         if not np.isfinite(noisy_np).all():
@@ -151,27 +160,25 @@ class NoisyWaveDataset(Dataset):
             clean_np = np.nan_to_num(clean_np, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.whiten:
-            mode = self.whiten_mode
-            used = None
-            if mode == "auto":
+            if self.whiten_mode == "auto":
                 if (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
                     fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
                     Pw = np.array(self._psd_welch[idx], dtype=np.float64)
-                    noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw); used = "welch"
+                    noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw)
                 elif self._psd_model is not None:
                     Pm = np.array(self._psd_model[idx], dtype=np.float64)
-                    noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm); used = "model"
+                    noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
                 else:
-                    noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np); used = "train"
-            elif mode == "welch" and (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
+                    noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np)
+            elif self.whiten_mode == "welch" and (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
                 fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
                 Pw = np.array(self._psd_welch[idx], dtype=np.float64)
-                noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw); used = "welch"
-            elif mode == "model" and (self._psd_model is not None):
+                noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw)
+            elif self.whiten_mode == "model" and (self._psd_model is not None):
                 Pm = np.array(self._psd_model[idx], dtype=np.float64)
-                noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm); used = "model"
+                noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
             else:
-                noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np); used = "train"
+                noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np)
 
         # per-sample sigma
         if self.sigma_mode == "std":
@@ -189,8 +196,27 @@ class NoisyWaveDataset(Dataset):
         noisy = torch.from_numpy(noisy_np).float().unsqueeze(0)
         sigma = torch.tensor(s, dtype=torch.float32)
         length = noisy.shape[-1]
-        return clean, noisy, sigma, length
 
+        #  metadata broadcast (4 channels)
+        if self.include_metadata:
+            def _get(dset, default=0.0):
+                try:
+                    return float(np.array(dset[idx]).item())
+                except Exception:
+                    return float(default)
+            m1 = _get(self._m1, 0.0)
+            m2 = _get(self._m2, 0.0)
+            s1 = _get(self._s1, 0.0)
+            s2 = _get(self._s2, 0.0)
+
+            meta_vec = np.array([ m1/max(self.mass_scale,1e-9),
+                                  m2/max(self.mass_scale,1e-9),
+                                  s1, s2 ], dtype=np.float32)
+            meta_bc = torch.from_numpy(np.tile(meta_vec[:, None], (1, length))).float()
+        else:
+            meta_bc = torch.zeros(0, length, dtype=torch.float32)
+
+        return clean, noisy, sigma, length, meta_bc
 
     def close(self):
         try:
@@ -204,15 +230,15 @@ class NoisyWaveDataset(Dataset):
         self._psd_model = None
         self._psd_welch = None
         self._psd_welch_freqs = None
+        self._m1 = self._m2 = self._s1 = self._s2 = None
 
     def __del__(self):
         self.close()
 
-
 def pad_collate(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    clean_list, noisy_list, sigma_list, len_list = zip(*batch)
+    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    clean_list, noisy_list, sigma_list, len_list, meta_list = zip(*batch)
     Lmax = int(max(len_list))
 
     def _pad_left(x: torch.Tensor, target: int) -> torch.Tensor:
@@ -230,8 +256,8 @@ def pad_collate(
         for s in sigma_list
     ], dim=0)
 
-    return clean_pad, noisy_pad, sigma, mask_pad
-
+    meta_pad = torch.stack([_pad_left(x, Lmax) for x in meta_list], dim=0)  # (B, 4, Lmax) or (B, 0, Lmax)
+    return clean_pad, noisy_pad, sigma, mask_pad, meta_pad
 
 def make_dataloader(
     h5_path: str,
@@ -246,6 +272,8 @@ def make_dataloader(
     sigma_mode: str = "std",
     sigma_fixed: float = 1.0,
     allow_no_signal: bool = False,
+    include_metadata: bool = True,
+    mass_scale: float = 80.0,
 ) -> DataLoader:
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -257,6 +285,8 @@ def make_dataloader(
         sigma_mode=sigma_mode,
         sigma_fixed=sigma_fixed,
         allow_no_signal=allow_no_signal,
+        include_metadata=include_metadata,
+        mass_scale=mass_scale,
     )
 
     loader = DataLoader(
