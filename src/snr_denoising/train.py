@@ -38,10 +38,13 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 @torch.no_grad()
-def _predict_x0_norm(model, diffusion, x_t, y_cond, t):
+def _predict_x0_norm(model, diffusion, x_t, cond_stack, t):
+    """
+    One-step x0 prediction from x_t using the full conditional stack (y + meta...).
+    """
     t = t.long()
     zeros_sc = torch.zeros_like(x_t)
-    net_in = torch.cat([x_t, y_cond, zeros_sc], dim=1)
+    net_in = torch.cat([x_t, cond_stack, zeros_sc], dim=1)
     eps_hat = model(net_in, t)
     ab = diffusion.alpha_bar[t].view(-1, 1, 1)
     x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
@@ -127,7 +130,29 @@ def train_diffusion(args):
         print(f"[train] dataset banner failed: {e}")
 
     device = torch.device(args.device)
-    in_ch = 3
+
+    # Peek one batch to infer meta channels (if any)
+    try:
+        _peek = next(iter(loader))
+    except StopIteration:
+        raise RuntimeError("Empty dataset")
+
+    # dataloader may return 4 or 5 tensors (clean, noisy, sigma, mask [, meta_stack])
+    if isinstance(_peek, (list, tuple)) and len(_peek) == 5:
+        _, _, _, _, meta_peek = _peek
+        C_meta = int(meta_peek.shape[1])
+        meta_enabled = True
+    else:
+        C_meta = 0
+        meta_enabled = False
+
+    # conditional channels = 1 (y) + C_meta (metadata)
+    cond_in_ch = 1 + C_meta
+    # total input channels = x_t (1) + cond (cond_in_ch) + selfcond (1)
+    use_selfcond = True
+    in_ch = 1 + cond_in_ch + (1 if use_selfcond else 0)
+
+    print(f"[train] meta_enabled={meta_enabled} , C_meta={C_meta} , cond_in_ch={cond_in_ch} , in_ch={in_ch}")
 
     # pass t_embed_max_time=T-1 to match normalized time embedding
     model = UNet1D(
@@ -136,9 +161,18 @@ def train_diffusion(args):
         time_dim=args.time_dim,
         depth=args.depth,
         t_embed_max_time=max(0, args.T - 1),
+        cond_in_ch=cond_in_ch,
+        use_selfcond=use_selfcond,
     ).to(device)
 
     diffusion = CustomDiffusion(T=args.T, device=device)
+
+    # load initial weights if requested (EMA preferred)
+    if getattr(args, 'init_from', None):
+        ckpt = torch.load(args.init_from, map_location=device)
+        state = ckpt.get('model_ema_state', ckpt.get('model_state'))
+        model.load_state_dict(state, strict=True)
+        print(f"[init] loaded weights from {args.init_from} (EMA={'model_ema_state' in ckpt})")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(loader) * args.epochs
@@ -196,21 +230,42 @@ def train_diffusion(args):
 
         printed_debug_this_epoch = False
 
-        for i, (clean_raw, noisy_raw, sigma, mask) in enumerate(pbar):
+        for i, batch in enumerate(pbar):
+            # unpack batch; support 4-return (legacy) and 5-return (with meta)
+            if isinstance(batch, (list, tuple)) and len(batch) == 5:
+                clean_raw, noisy_raw, sigma, mask, meta_stack = batch
+                meta_stack = meta_stack.to(device, non_blocking=True).float()
+            else:
+                clean_raw, noisy_raw, sigma, mask = batch
+                meta_stack = None
+
             clean_raw = clean_raw.to(device, non_blocking=True).float()
             noisy_raw = noisy_raw.to(device, non_blocking=True).float()
             sigma = sigma.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True).float()
             bsz, _, L = clean_raw.shape
 
+            # normalize time-series channels by sigma (match whitening domain)
             sigma_ = sigma.view(-1, 1, 1)
             clean_norm = clean_raw / sigma_
-            cond_norm = noisy_raw / sigma_
+            y_norm = noisy_raw / sigma_
 
-            # optional clamping
+            # metadata channels are assumed already by the dataloader
+            # (e.g., spins in [-1,1], masses scaled). They are NOT divided by sigma.
+            if meta_stack is not None:
+                # ensure same temporal length as y_norm
+                if meta_stack.size(-1) != y_norm.size(-1):
+                    meta_stack = F.interpolate(meta_stack, size=y_norm.size(-1),
+                                               mode="linear", align_corners=False)
+                cond_stack = torch.cat([y_norm, meta_stack], dim=1)  # [B, 1+C_meta, L]
+            else:
+                cond_stack = y_norm  # [B, 1, L]
+
+            # optional clamping of normalized signals (keeps meta untouched)
             if args.clamp_inputs > 0:
                 clean_norm = clean_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
-                cond_norm = cond_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
+                y_norm = y_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
+                # do not clamp metadata by default
 
             # biased timestep sampling: t in [t_min, T-1]
             t_min = t_min_epoch
@@ -222,12 +277,24 @@ def train_diffusion(args):
                 if args.clamp_inputs > 0:
                     x_t = x_t.clamp(-args.clamp_inputs, args.clamp_inputs)
 
-                # CFG dropout (can be forced off)
+                # CFG dropout:
+                #   - y-only: drop measurement but KEEP metadata (supervisor's c1 vs c2)
+                #   - all: drop entire conditional stack (legacy behavior)
                 if p_uncond_eff > 0.0:
                     drop = (torch.rand(bsz, 1, 1, device=device) < p_uncond_eff).float()
-                    cond_used = cond_norm * (1.0 - drop)
+                    if (meta_stack is not None) and args.dropout_y_only:
+                        y_used = y_norm * (1.0 - drop)
+                        if meta_stack.size(-1) != y_used.size(-1):
+                            meta_used = F.interpolate(meta_stack, size=y_used.size(-1),
+                                                      mode="linear", align_corners=False)
+                        else:
+                            meta_used = meta_stack
+                        cond_used = torch.cat([y_used, meta_used], dim=1)
+                    else:
+                        # drop all cond
+                        cond_used = cond_stack * (1.0 - drop)
                 else:
-                    cond_used = cond_norm
+                    cond_used = cond_stack
 
                 # self-conditioning (can be forced off)
                 if p_selfcond_eff > 0.0 and torch.rand((), device=device) < p_selfcond_eff:
@@ -261,10 +328,10 @@ def train_diffusion(args):
             if args.skip_bad_batches and loss.item() > args.skip_loss_threshold:
                 with torch.no_grad():
                     smin = sigma.min().item(); smean = sigma.mean().item(); smax = sigma.max().item()
-                    cn_max = cond_norm.abs().max().item()
+                    yn_max = y_norm.abs().max().item()
                 pbar.write(f"[warn] loss {loss.item():.3e} > {args.skip_loss_threshold} "
                            f"skip (sigma[min/mean/max]={smin:.3e}/{smean:.3e}/{smax:.3e}, "
-                           f"(cond_norm)_max={cn_max:.3e})")
+                           f"(y_norm)_max={yn_max:.3e})")
                 skipped_batches += 1
                 continue
 
@@ -315,15 +382,24 @@ def train_diffusion(args):
             if args.probe_cond and (i % max(1, args.probe_interval) == 0):
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     c0 = (clean_norm[0:1]).detach()
-                    y0 = (cond_norm[0:1]).detach()
+                    y0 = (y_norm[0:1]).detach()
                     zeros_y = torch.zeros_like(y0)
                     zeros_sc = torch.zeros_like(c0)
+
+                    if meta_stack is not None:
+                        m0 = (meta_stack[0:1]).detach()
+                        cond_on  = torch.cat([y0, m0], dim=1)
+                        cond_off = torch.cat([zeros_y, m0], dim=1)  # drop y only
+                    else:
+                        cond_on  = y0
+                        cond_off = zeros_y
+
                     for t_pick in args.probe_t:
                         t_probe = torch.tensor([max(0, min(args.T - 1, int(t_pick)))],
                                                device=device, dtype=torch.long)
                         x_t_p, eps_p = diffusion.q_sample(c0, t_probe)
-                        net_on = torch.cat([x_t_p, y0, zeros_sc], dim=1)
-                        net_off = torch.cat([x_t_p, zeros_y, zeros_sc], dim=1)
+                        net_on = torch.cat([x_t_p, cond_on, zeros_sc], dim=1)
+                        net_off = torch.cat([x_t_p, cond_off, zeros_sc], dim=1)
                         eps_on = model(net_on, t_probe)
                         eps_off = model(net_off, t_probe)
                         mse_on = float(F.mse_loss(eps_on, eps_p).item())
@@ -344,7 +420,7 @@ def train_diffusion(args):
                             "cond_delta_rms": delta_rms,
                         })
 
-            # ---- rate limited batch probe: once on epoch 1, optionally every N epochs
+            # ---- deep first-batch debug (masked metrics & quick npy dump)
             if (i == 0) and (not printed_debug_this_epoch) and _do_debug_this_epoch(epoch):
                 printed_debug_this_epoch = True
 
@@ -352,13 +428,16 @@ def train_diffusion(args):
                     return x.min().item(), x.max().item(), x.mean().item(), x.std().item()
 
                 cn_min, cn_max, cn_mean, cn_std = _stats(clean_norm)
-                yn_min, yn_max, yn_mean, yn_std = _stats(cond_norm)
+                yn_min, yn_max, yn_mean, yn_std = _stats(y_norm)
                 ct_min, ct_max, ct_mean, ct_std = _stats(x_t)
                 eh_min, eh_max, eh_mean, eh_std = _stats(eps_hat)
 
                 print(f"[DEBUG] sigma[min/mean/max]={sigma.min().item():.3e}/{sigma.mean().item():.3e}/{sigma.max().item():.3e}")
                 print(f"[DEBUG] clean_norm: min={cn_min:.3e}, max={cn_max:.3e}, mean={cn_mean:.3e}, std={cn_std:.3e}")
-                print(f"[DEBUG] cond_norm:  min={yn_min:.3e}, max={yn_max:.3e}, mean={yn_mean:.3e}, std={yn_std:.3e}")
+                print(f"[DEBUG] y_norm:     min={yn_min:.3e}, max={yn_max:.3e}, mean={yn_mean:.3e}, std={yn_std:.3e}")
+                if meta_stack is not None:
+                    ms_min, ms_max, ms_mean, ms_std = meta_stack.min().item(), meta_stack.max().item(), meta_stack.mean().item(), meta_stack.std().item()
+                    print(f"[DEBUG] meta_stack: min={ms_min:.3e}, max={ms_max:.3e}, mean={ms_mean:.3e}, std={ms_std:.3e}")
                 print(f"[DEBUG] x_t:        min={ct_min:.3e}, max={ct_max:.3e}, mean={ct_mean:.3e}, std={ct_std:.3e}")
                 print(f"[DEBUG] eps_hat:    min={eh_min:.3e}, max={eh_max:.3e}, mean={eh_mean:.3e}, std={eh_std:.3e}")
 
@@ -366,11 +445,7 @@ def train_diffusion(args):
                 x0_hat_norm = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
                 x0_hat = x0_hat_norm * sigma.view(-1, 1, 1)
 
-                x0_min, x0_max, x0_mean, x0_std = _stats(x0_hat)
-                print(f"[DEBUG] recon_unnorm: min={x0_min:.3e}, max={x0_max:.3e}, mean={x0_mean:.3e}, std={x0_std:.3e}")
-
                 def _corr_masked(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
-                    # a,b: [1,1,L], m: [1,1,L] with 1s on valid region
                     a1 = a[m > 0.5].reshape(-1)
                     b1 = b[m > 0.5].reshape(-1)
                     if a1.numel() < 2 or b1.numel() < 2:
@@ -382,12 +457,9 @@ def train_diffusion(args):
 
                 m0 = (mask[0:1]).float()  # [1,1,L] valid=1, pad=0
 
-                # correlations in normalized (whitened, sigma-normalized) domain
                 corr_x0n = _corr_masked(x0_hat_norm[0:1], clean_norm[0:1], m0)
-                # correlations in whitened (but unnormalized-by-sigma) domain
                 corr_x0w = _corr_masked(x0_hat[0:1], clean_raw[0:1], m0)
 
-                # masked MSE (both domains)
                 mse_x0n = (((x0_hat_norm - clean_norm) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
                 mse_x0w = (((x0_hat - clean_raw) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
 
@@ -397,20 +469,13 @@ def train_diffusion(args):
                       f"corr_masked(x0, clean)={corr_x0w:.3f} , "
                       f"MSE_masked_norm={mse_x0n.item():.3e} , MSE_masked_white={mse_x0w.item():.3e}")
 
-                # quick correlations on sample 0
-                try:
-                    corr_eps = _corr_torch(eps_hat[0], eps[0]).item()
-                    print(f"[DEBUG] corr(eps_hat, eps)={corr_eps:.3f}")
-                except Exception:
-                    pass
-
                 # tiny npy dump (first epoch only)
                 if epoch == 1:
                     try:
                         dbg_dir = os.path.join(out_dir, "debug_batch0")
                         os.makedirs(dbg_dir, exist_ok=True)
                         np.save(os.path.join(dbg_dir, "clean_raw.npy"), clean_raw[0].detach().cpu().numpy().ravel())
-                        np.save(os.path.join(dbg_dir, "cond_norm.npy"), cond_norm[0].detach().cpu().numpy().ravel())
+                        np.save(os.path.join(dbg_dir, "y_norm.npy"), y_norm[0].detach().cpu().numpy().ravel())
                         np.save(os.path.join(dbg_dir, "x0_hat.npy"), x0_hat[0].detach().cpu().numpy().ravel())
                         print(f"[DEBUG] wrote debug npys -> {dbg_dir}")
                     except Exception as e:
@@ -444,10 +509,14 @@ def train_diffusion(args):
             **vars(args),
             'conditional': True,
             'in_ch': in_ch,
-            'conditioning': 'concat_noisy+selfcond',
+            'cond_in_ch': cond_in_ch,
+            'meta_enabled': meta_enabled,
+            'meta_channels': C_meta,
+            'conditioning': ('concat[y + meta]+selfcond' if meta_enabled else 'concat[y]+selfcond'),
             'whiten': args.whiten,
             'whiten_mode': args.whiten_mode,
             'sigma_mode': args.sigma_mode,
+            'dropout_y_only': bool(args.dropout_y_only),
         },
         'epoch': args.epochs,
     }
@@ -458,7 +527,7 @@ def train_diffusion(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train conditional diffusion denoiser on LIGO waveforms")
+    parser = argparse.ArgumentParser(description="Train conditional diffusion denoiser on LIGO waveforms (y + optional metadata)")
     parser.add_argument('--data',       type=str, required=True)
     parser.add_argument('--model_dir',  type=str, default='model')
     parser.add_argument('--epochs',     type=int,   default=50)
@@ -514,7 +583,7 @@ if __name__ == '__main__':
     parser.add_argument('--cosine_decay', action='store_true', help='Enable cosine decay after warmup')
     parser.add_argument('--min_lr_scale', type=float, default=0.1, help='Final LR as fraction of base LR for cosine')
 
-    # timestep loss weighting: weight --> (1 - alpha_bar[t])^p i.e --> scheduler
+    # timestep loss weighting: weight --> (1 - alpha_bar[t])^p
     parser.add_argument('--loss_weight_power', type=float, default=0.0,
                         help='0 disables; >0 emphasizes noisier steps')
 
@@ -523,6 +592,13 @@ if __name__ == '__main__':
                         help='How to whiten training data: use saved per-sample PSDs if available.')
     parser.add_argument('--sigma_mode', choices=['std', 'mad', 'fixed'], default='std')
     parser.add_argument('--sigma_fixed', type=float, default=1.0)
+
+    parser.add_argument('--init-from', type=str, default=None,
+                        help='Path to checkpoint (.pth) to init model weights from (EMA used if present).')
+
+    # metadata conditioning behaviors
+    parser.add_argument('--dropout_y_only', action='store_true', default=True,
+                        help='If set (default), CFG dropout zeros only the y channel and keeps metadata on.')
 
     args = parser.parse_args()
     args.device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
