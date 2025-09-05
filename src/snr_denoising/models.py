@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+from typing import List, Optional
 
 
 class TimeEmbedding(nn.Module):
@@ -59,27 +59,47 @@ class CustomDiffusion:
         return x_t, eps
 
 
-
 class UNet1D(nn.Module):
     """
     1D UNet with:
       • FiLM-style time conditioning (gamma, beta) at every stage
-      • Conditioning from y injected at every stage
-    Inputs:
-            convention: channel 0 = x_t, channel 1 = y (if present), channel 2 = self-cond (if present)
-    Output: eps_hat
+      • Conditioning injected at every stage via 1x1 conv bias from *multiple* cond channels
+
+    Channel convention (generalised):
+        x input = [ x_t |  cond_0..cond_{K-1}  |  (optional) x0_selfcond ]
+        - x_t is always channel 0
+        - cond_0 is typically the measurement y; remaining conds can be metadata (m1,m2,s1z,s2z,...)
+        - last channel is self-conditioning only if use_selfcond=True
+
+    Backward compatibility:
+        If you pass the old layout (in_ch=3) the module behaves as before:
+            [x_t, y, x0_sc]  => cond_in_ch inferred as 1, use_selfcond inferred as True.
     """
     def __init__(
         self,
-        in_ch: int = 1,
+        in_ch: int = 1,                 # total input channels
         base_ch: int = 64,
         time_dim: int = 128,
         depth: int = 3,
         kernel: int = 3,
-        t_embed_max_time: float = 999.0,  # for normalized time embedding when T=1000
+        t_embed_max_time: float = 999.0,   # for normalized time embedding when T=1000
+        cond_in_ch: Optional[int] = None,  # number of conditional channels; if None, inferred from in_ch
+        use_selfcond: Optional[bool] = None,  # if None, inferred from in_ch (True when in_ch>=3 by default)
     ):
         super().__init__()
+        # infer conditioning layout
+        if use_selfcond is None:
+            # legacy default: 3 channels meant [x_t, y, x0_sc]
+            use_selfcond = (in_ch >= 3)
+        self.use_selfcond = bool(use_selfcond)
+
+        if cond_in_ch is None:
+            cond_in_ch = max(in_ch - 1 - (1 if self.use_selfcond else 0), 0)
+        self.cond_in_ch = int(cond_in_ch)
+
+        # store
         self.in_ch = in_ch
+        self.in_ch_total = in_ch
 
         # time embedding -> [B, base_ch]
         self.time_mlp = nn.Sequential(
@@ -108,7 +128,7 @@ class UNet1D(nn.Module):
             self.decoders.append(self._conv_block(prev_ch + skip_ch, skip_ch, kernel))
             prev_ch = skip_ch
 
-        # final head: only skip x_t (not y/self-cond) --> helps avoid direct leakage of high level features
+        # final head: only skip x_t (not the cond/self-cond) --> helps avoid direct leakage of high level features
         self.final = nn.Conv1d(prev_ch + 1, 1, kernel, padding=kernel // 2)
         nn.init.zeros_(self.final.weight)
         nn.init.zeros_(self.final.bias)
@@ -121,10 +141,15 @@ class UNet1D(nn.Module):
         self.tproj_mid = _make_tproj(chs[-1])
         self.tproj_dec = nn.ModuleList([_make_tproj(c) for c in reversed(chs)])
 
-        # if in_ch < 2 (no y provided), these layers exist but are fed zeros instead
-        self.cond_enc = nn.ModuleList([nn.Conv1d(1, c, kernel_size=1) for c in chs])
-        self.cond_mid = nn.Conv1d(1, chs[-1], kernel_size=1)
-        self.cond_dec = nn.ModuleList([nn.Conv1d(1, c, kernel_size=1) for c in reversed(chs)])
+        # conditional biases (map cond_in_ch -> layer channels); if no conds, use Identity
+        if self.cond_in_ch > 0:
+            self.cond_enc = nn.ModuleList([nn.Conv1d(self.cond_in_ch, c, kernel_size=1) for c in chs])
+            self.cond_mid = nn.Conv1d(self.cond_in_ch, chs[-1], kernel_size=1)
+            self.cond_dec = nn.ModuleList([nn.Conv1d(self.cond_in_ch, c, kernel_size=1) for c in reversed(chs)])
+        else:
+            self.cond_enc = nn.ModuleList([nn.Identity() for _ in chs])
+            self.cond_mid = nn.Identity()
+            self.cond_dec = nn.ModuleList([nn.Identity() for _ in chs])
 
     @staticmethod
     def _group_norm_block(out_ch: int) -> nn.GroupNorm:
@@ -147,36 +172,44 @@ class UNet1D(nn.Module):
         gamma, beta = t_vec.chunk(2, dim=1)
         return h * (1 + gamma[:, :, None]) + beta[:, :, None]
 
-    def _y_or_zeros(self, x: torch.Tensor) -> torch.Tensor:
-        if self.in_ch >= 2:
-            return x[:, 1:2, :]
-        else:
-            return torch.zeros(x.size(0), 1, x.size(-1), device=x.device, dtype=x.dtype)
+    def _split_inputs(self, x: torch.Tensor):
+        """
+        Split concatenated inputs into:
+            x_t (B,1,L), cond (B,cond_in_ch,L) or None, selfcond (B,1,L) or None
+        """
+        B, C, L = x.shape
+        x_t = x[:, :1, :]
+        p = 1
+        cond = x[:, p:p + self.cond_in_ch, :] if self.cond_in_ch > 0 else None
+        p += self.cond_in_ch
+        sc = x[:, p:p+1, :] if self.use_selfcond else None
+        return x_t, cond, sc
 
-    def _cond_bias(self, y: torch.Tensor, L: int, layer: nn.Conv1d) -> torch.Tensor:
-        # interpolate y to match current temporal length, then 1×1 conv to pass channels
-        yL = F.interpolate(y, size=L, mode="linear", align_corners=False)
-        return layer(yL)
+    def _cond_bias(self, cond: Optional[torch.Tensor], L: int, layer: nn.Module) -> torch.Tensor:
+        if cond is None or isinstance(layer, nn.Identity):
+            # return a tensor that broadcasts correctly
+            return 0.0
+        cL = F.interpolate(cond, size=L, mode="linear", align_corners=False)
+        return layer(cL)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B, C, L0 = x.shape
         t_ctx = self.time_mlp(t)  # [B, base_ch]
-        y = self._y_or_zeros(x)
+        x_t, cond, _ = self._split_inputs(x)
 
         # encode
         skips = []
         h = x
         for i, enc in enumerate(self.encoders):
             h = enc(h)  # [B, C_i, L]
-            # inject y bias with skip connection then FiLM
-            h = h + self._cond_bias(y, h.size(-1), self.cond_enc[i])
+            h = h + self._cond_bias(cond, h.size(-1), self.cond_enc[i])
             h = self._apply_film(h, self.tproj_enc[i](t_ctx))
             skips.append(h)
             h = F.avg_pool1d(h, 2, 2)
 
         # mid
         h = self.mid(h)
-        h = h + self._cond_bias(y, h.size(-1), self.cond_mid)
+        h = h + self._cond_bias(cond, h.size(-1), self.cond_mid)
         h = self._apply_film(h, self.tproj_mid(t_ctx))
 
         # decode
@@ -187,13 +220,12 @@ class UNet1D(nn.Module):
                 h = F.pad(h, (0, diff)) if diff > 0 else h[..., :skip.size(-1)]
             h = torch.cat([h, skip], dim=1)
             h = dec(h)
-            # inject y bias with skip connection then FiLM
-            h = h + self._cond_bias(y, h.size(-1), self.cond_dec[i])
+            h = h + self._cond_bias(cond, h.size(-1), self.cond_dec[i])
             h = self._apply_film(h, self.tproj_dec[i](t_ctx))
 
         # final skip with x_t only (channel 0)
         if h.size(-1) != x.size(-1):
             diff = x.size(-1) - h.size(-1)
             h = F.pad(h, (0, diff)) if diff > 0 else h[..., :x.size(-1)]
-        out = self.final(torch.cat([h, x[:, :1, :]], dim=1))
+        out = self.final(torch.cat([h, x_t], dim=1))
         return out
