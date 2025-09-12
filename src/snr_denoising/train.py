@@ -54,7 +54,7 @@ def _element_loss(eps_hat, eps, mask, loss_type: str, huber_beta: float):
     if loss_type == "huber":
         el = F.smooth_l1_loss(eps_hat, eps, reduction="none", beta=huber_beta)
     else:
-        el = (eps_hat - eps) ** 2       # mse
+        el = (eps_hat - eps) ** 2  # mse
     return el * mask
 
 def _corr_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -85,17 +85,102 @@ def make_warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int,
     def lr_lambda(step: int):
         if step < warmup_steps:
             return max(1e-8, float(step + 1) / max(1, warmup_steps))
-        # cosine from 1.0 down to min_lr_scale
         progress = (step - warmup_steps) / max(1, (total_steps - warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
         return min_lr_scale + 0.5 * (1 - min_lr_scale) * (1 + math.cos(math.pi * progress))
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+def _resolve_h5(path: str) -> str:
+    if os.path.isdir(path):
+        cands = [os.path.join(path, f) for f in os.listdir(path)
+                 if f.lower().endswith(('.h5', '.hdf5'))]
+        cands.sort(key=os.path.getmtime, reverse=True)
+        if not cands:
+            raise FileNotFoundError(f"No .h5/.hdf5 in directory: {path}")
+        return cands[0]
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"HDF5 path not found: {path}")
+    return path
+
+def _compute_meta_scale(h5_file: str) -> dict:
+    """
+    Compute dataset-adaptive scales for labels; scaling by 95th percentile by default.
+    """
+    scale = {"M": 80.0, "q": 10.0}  # some reasonable defaults
+    try:
+        import h5py
+        with h5py.File(h5_file, "r") as f:
+            def p95(name):
+                if name in f:
+                    arr = np.array(f[name][:], dtype=np.float64)
+                    if arr.size:
+                        return float(np.nanpercentile(arr, 95))
+                return None
+
+            m1_p = p95("mass1"); m2_p = p95("mass2"); mc_p = p95("chirp_mass")
+            q_p  = p95("q")
+
+            Ms = [x for x in [m1_p, m2_p, mc_p] if (x is not None and np.isfinite(x) and x > 0)]
+            if Ms:
+                scale["M"] = float(max(Ms))   # one mass scale for m1, m2
+            if (q_p is not None) and np.isfinite(q_p) and q_p > 0:
+                scale["q"] = float(q_p)
+    except Exception as e:
+        print(f"[train] meta_scale computation failed; using defaults {scale} ({e})")
+    return scale
+
+# batch matcher (safe for enabling t_multi wen stratified t-sampling)
+def _match_batch(a: torch.Tensor, target_bsz: int) -> torch.Tensor:
+    """
+    Return 'a' with batch dimension == target_bsz.
+    If a.shape[0] divides target_bsz, repeat_interleave; otherwise trim.
+    """
+    if a.shape[0] == target_bsz or a.shape[0] == 0:
+        return a
+    if target_bsz % a.shape[0] == 0:
+        rep = target_bsz // a.shape[0]
+        return a.repeat_interleave(rep, dim=0)
+    rep = (target_bsz + a.shape[0] - 1) // a.shape[0]
+    return a.repeat_interleave(rep, dim=0)[:target_bsz]
+
+# ------------- stratified timestep sampler -----------
+def _sample_timesteps_stratified(bsz: int, t_min: int, t_max: int, device, bins: int = 0) -> torch.Tensor:
+    """
+    Return 'bsz' timesteps roughly covering [t_min, t_max] uniformly by strata.
+    bins: number of buckets; if 0, use bsz.
+    """
+    b = int(bins) if bins and bins > 0 else int(bsz)
+    b = max(1, min(b, bsz))
+    edges = torch.linspace(t_min, t_max + 1, b + 1, device=device).long()
+    q, r = divmod(bsz, b)
+    counts = [q + 1 if i < r else q for i in range(b)]
+    ts = []
+    for i in range(b):
+        lo = int(edges[i].item())
+        hi = int(edges[i + 1].item()) - 1
+        if hi < lo:
+            hi = lo
+        if counts[i] > 0:
+            ts.append(torch.randint(lo, hi + 1, (counts[i],), device=device))
+    t = torch.cat(ts, dim=0) if ts else torch.randint(t_min, t_max + 1, (bsz,), device=device)
+    if t.numel() > bsz:
+        t = t[:bsz]
+    elif t.numel() < bsz:
+        pad = torch.randint(t_min, t_max + 1, (bsz - t.numel(),), device=device)
+        t = torch.cat([t, pad], dim=0)
+    perm = torch.randperm(bsz, device=device)
+    return t[perm].long()
 
 def train_diffusion(args):
     set_seed(args.seed)
     out_dir = prepare_output_dir(args.model_dir)
 
+    # compute label scaling BEFORE creating the loader
+    h5_path = _resolve_h5(args.data)
+    meta_scale = _compute_meta_scale(h5_path)
+    print(f"[train] meta_scale (dataset-adaptive): {meta_scale}")
+
+    # create loade ---> pass mass_scale for m1/m2 scaling
     loader: DataLoader = make_dataloader(
         h5_path=args.data,
         batch_size=args.batch_size,
@@ -108,6 +193,8 @@ def train_diffusion(args):
         whiten_mode=args.whiten_mode,
         sigma_mode=args.sigma_mode,
         sigma_fixed=args.sigma_fixed,
+        include_metadata=True,
+        mass_scale=float(meta_scale.get("M", 80.0)),
     )
 
     print(f"[train] Dataset size: {len(loader.dataset)}")
@@ -131,7 +218,7 @@ def train_diffusion(args):
 
     device = torch.device(args.device)
 
-    # Peek one batch to infer meta channels (if any)
+    # peek one batch to infer meta channels (unless passed 0's)
     try:
         _peek = next(iter(loader))
     except StopIteration:
@@ -250,10 +337,8 @@ def train_diffusion(args):
             clean_norm = clean_raw / sigma_
             y_norm = noisy_raw / sigma_
 
-            # metadata channels are assumed already by the dataloader
-            # (e.g., spins in [-1,1], masses scaled). They are NOT divided by sigma.
+            # metadata channels scaled in dataloader
             if meta_stack is not None:
-                # ensure same temporal length as y_norm
                 if meta_stack.size(-1) != y_norm.size(-1):
                     meta_stack = F.interpolate(meta_stack, size=y_norm.size(-1),
                                                mode="linear", align_corners=False)
@@ -265,11 +350,30 @@ def train_diffusion(args):
             if args.clamp_inputs > 0:
                 clean_norm = clean_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
                 y_norm = y_norm.clamp(-args.clamp_inputs, args.clamp_inputs)
-                # do not clamp metadata by default
 
-            # biased timestep sampling: t in [t_min, T-1]
+            # ------------ timestep sampling (stratified + optional multi-repeats) ----------
             t_min = t_min_epoch
-            t = torch.randint(t_min, args.T, (bsz,), device=device, dtype=torch.long)
+            t_max = args.T - 1
+
+            K = max(1, int(args.t_multi))
+            if K > 1:
+                clean_norm = clean_norm.repeat_interleave(K, dim=0)
+                y_norm     = y_norm.repeat_interleave(K, dim=0)
+                mask       = mask.repeat_interleave(K, dim=0)
+                sigma      = sigma.repeat_interleave(K, dim=0)
+                if meta_stack is not None:
+                    meta_stack = meta_stack.repeat_interleave(K, dim=0)
+                if meta_stack is not None:
+                    cond_stack = torch.cat([y_norm, meta_stack], dim=1)
+                else:
+                    cond_stack = y_norm
+
+            bsz_eff = clean_norm.size(0)
+
+            if args.t_cover == 'strat':
+                t = _sample_timesteps_stratified(bsz_eff, t_min, t_max, device, bins=args.t_bins)
+            else:
+                t = torch.randint(t_min, args.T, (bsz_eff,), device=device, dtype=torch.long)
 
             with torch.amp.autocast('cuda', enabled=args.amp):
                 x_t, eps = diffusion.q_sample(clean_norm, t)
@@ -277,11 +381,9 @@ def train_diffusion(args):
                 if args.clamp_inputs > 0:
                     x_t = x_t.clamp(-args.clamp_inputs, args.clamp_inputs)
 
-                # CFG dropout:
-                #   - y-only: drop measurement but KEEP metadata (supervisor's c1 vs c2)
-                #   - all: drop entire conditional stack (legacy behavior)
+                # CFG dropout (y-only if requested) -- uses batch size
                 if p_uncond_eff > 0.0:
-                    drop = (torch.rand(bsz, 1, 1, device=device) < p_uncond_eff).float()
+                    drop = (torch.rand(x_t.size(0), 1, 1, device=device) < p_uncond_eff).float()
                     if (meta_stack is not None) and args.dropout_y_only:
                         y_used = y_norm * (1.0 - drop)
                         if meta_stack.size(-1) != y_used.size(-1):
@@ -291,7 +393,6 @@ def train_diffusion(args):
                             meta_used = meta_stack
                         cond_used = torch.cat([y_used, meta_used], dim=1)
                     else:
-                        # drop all cond
                         cond_used = cond_stack * (1.0 - drop)
                 else:
                     cond_used = cond_stack
@@ -309,10 +410,9 @@ def train_diffusion(args):
                 # base element loss
                 el = _element_loss(eps_hat, eps, mask, args.loss, args.huber_beta)
 
-                # optional timestep weighting (emphasize certain noise region)
+                # timestep weighting
                 if args.loss_weight_power != 0.0:
                     ab = diffusion.alpha_bar[t].view(-1, 1, 1)
-                    # weight --> (1 - alpha_bar)^p ; p>0 emphasizes noisier steps
                     w = (1.0 - ab).pow(args.loss_weight_power)
                     el = el * w
 
@@ -357,8 +457,8 @@ def train_diffusion(args):
             # stats
             loss_val = float(loss.item())
             batch_losses.append(loss_val)
-            sum_loss_weighted += loss_val * bsz
-            sum_weight += bsz
+            sum_loss_weighted += loss_val * bsz_eff
+            sum_weight += bsz_eff
             running_avg = sum_loss_weighted / max(1, sum_weight)
             lr_now = optimizer.param_groups[0]["lr"]
             pbar.set_postfix(loss=f"{loss_val:.6f}", avg=f"{running_avg:.6f}", lr=f"{lr_now:.2e}")
@@ -398,14 +498,14 @@ def train_diffusion(args):
                         t_probe = torch.tensor([max(0, min(args.T - 1, int(t_pick)))],
                                                device=device, dtype=torch.long)
                         x_t_p, eps_p = diffusion.q_sample(c0, t_probe)
-                        net_on = torch.cat([x_t_p, cond_on, zeros_sc], dim=1)
+                        net_on  = torch.cat([x_t_p, cond_on,  zeros_sc], dim=1)
                         net_off = torch.cat([x_t_p, cond_off, zeros_sc], dim=1)
-                        eps_on = model(net_on, t_probe)
-                        eps_off = model(net_off, t_probe)
+                        eps_on = model(net_on,  t_probe)
+                        eps_off= model(net_off, t_probe)
                         mse_on = float(F.mse_loss(eps_on, eps_p).item())
-                        mse_off = float(F.mse_loss(eps_off, eps_p).item())
-                        corr_on = float(_corr_torch(eps_on, eps_p).item())
-                        corr_off = float(_corr_torch(eps_off, eps_p).item())
+                        mse_off= float(F.mse_loss(eps_off, eps_p).item())
+                        corr_on= float(_corr_torch(eps_on, eps_p).item())
+                        corr_off=float(_corr_torch(eps_off, eps_p).item())
                         delta = eps_on - eps_off
                         delta_rms = float(torch.linalg.norm(delta.reshape(-1)) / (delta.numel() ** 0.5))
                         _log_jsonl(args.log_jsonl, {
@@ -420,7 +520,7 @@ def train_diffusion(args):
                             "cond_delta_rms": delta_rms,
                         })
 
-            # ---- deep first-batch debug (masked metrics & quick npy dump)
+            # deep first-batch debug (metrics + quick npy dump)
             if (i == 0) and (not printed_debug_this_epoch) and _do_debug_this_epoch(epoch):
                 printed_debug_this_epoch = True
 
@@ -457,11 +557,15 @@ def train_diffusion(args):
 
                 m0 = (mask[0:1]).float()  # [1,1,L] valid=1, pad=0
 
+                # masked correlations
                 corr_x0n = _corr_masked(x0_hat_norm[0:1], clean_norm[0:1], m0)
-                corr_x0w = _corr_masked(x0_hat[0:1], clean_raw[0:1], m0)
+                # ensure raw clean matches effective batch for MSE/corr
+                clean_raw_eff = _match_batch(clean_raw, x0_hat.size(0))
+                corr_x0w = _corr_masked(x0_hat[0:1], clean_raw_eff[0:1], m0)
 
+                # masked MSEs
                 mse_x0n = (((x0_hat_norm - clean_norm) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
-                mse_x0w = (((x0_hat - clean_raw) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
+                mse_x0w = (((x0_hat - clean_raw_eff) ** 2) * m0).sum() / m0.sum().clamp_min(1.0)
 
                 valid_frac = float(m0.mean().item())
                 print(f"[DEBUG] valid_frac={valid_frac:.3f} , "
@@ -469,7 +573,6 @@ def train_diffusion(args):
                       f"corr_masked(x0, clean)={corr_x0w:.3f} , "
                       f"MSE_masked_norm={mse_x0n.item():.3e} , MSE_masked_white={mse_x0w.item():.3e}")
 
-                # tiny npy dump (first epoch only)
                 if epoch == 1:
                     try:
                         dbg_dir = os.path.join(out_dir, "debug_batch0")
@@ -517,6 +620,7 @@ def train_diffusion(args):
             'whiten_mode': args.whiten_mode,
             'sigma_mode': args.sigma_mode,
             'dropout_y_only': bool(args.dropout_y_only),
+            'meta_scale': meta_scale,  # <--- save for inference reuse
         },
         'epoch': args.epochs,
     }
@@ -524,7 +628,6 @@ def train_diffusion(args):
         payload['model_ema_state'] = ema_model.state_dict()
     torch.save(payload, save_path)
     print(f"Saved model to {save_path}")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train conditional diffusion denoiser on LIGO waveforms (y + optional metadata)")
@@ -551,6 +654,14 @@ if __name__ == '__main__':
                         help='sample t uniformly from [t_min_frac*T, T-1]')
     parser.add_argument('--force_cond_epochs', type=int, default=0,
                         help='for first N epochs, set p_uncond=0 and p_selfcond=0')
+
+    # timestep coverage controls
+    parser.add_argument('--t_cover', choices=['rand','strat'], default='rand',
+                        help='How to draw timesteps per batch: rand=old behavior, strat=cover [t_min..T-1] uniformly within each batch')
+    parser.add_argument('--t_bins', type=int, default=0,
+                        help='Number of strata for --t_cover strat (0=use batch size)')
+    parser.add_argument('--t_multi', type=int, default=1,
+                        help='Repeat each batch item K times with different t (increases effective batch size by K)')
 
     # robustness knobs
     parser.add_argument('--loss', choices=['mse','huber'], default='huber')
