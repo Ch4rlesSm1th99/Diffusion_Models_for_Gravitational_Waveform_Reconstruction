@@ -31,10 +31,15 @@ class NoisyWaveDataset(Dataset):
                  include_metadata: bool = True,
                  mass_scale: float = 80.0):
         """
-        Returns (clean, noisy, sigma, length, meta_bc)
+        Returns: (clean, noisy, sigma, mask, meta_bc)
 
         meta_bc: (4, L) broadcast of [m1/mass_scale, m2/mass_scale, spin1z, spin2z].
         If meta datasets are missing or include_metadata=False, zeros are returned.
+        Whitening modes:
+          - 'model' : use saved per-sample model PSD ('psd_model' or legacy 'psd')
+          - 'welch' : use saved per-sample Welch PSD ('psd_welch' + 'psd_welch_freqs')
+          - 'train' : simple FFT power + 9-tap smoothing estimator
+          - 'auto'  : PREFER model -> welch -> train
         """
         self.h5_path = resolve_h5_path(h5_path)
         self.h5 = None
@@ -159,28 +164,30 @@ class NoisyWaveDataset(Dataset):
         if not np.isfinite(clean_np).all():
             clean_np = np.nan_to_num(clean_np, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # WHITENING
         if self.whiten:
             if self.whiten_mode == "auto":
-                if (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
+                # PREFER PSD model -> welch -> train estimate
+                if self._psd_model is not None:
+                    Pm = np.array(self._psd_model[idx], dtype=np.float64)
+                    noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
+                elif (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
                     fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
                     Pw = np.array(self._psd_welch[idx], dtype=np.float64)
                     noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw)
-                elif self._psd_model is not None:
-                    Pm = np.array(self._psd_model[idx], dtype=np.float64)
-                    noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
                 else:
                     noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np)
-            elif self.whiten_mode == "welch" and (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
+            elif (self.whiten_mode == "model") and (self._psd_model is not None):
+                Pm = np.array(self._psd_model[idx], dtype=np.float64)
+                noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
+            elif (self.whiten_mode == "welch") and (self._psd_welch is not None) and (self._psd_welch_freqs is not None):
                 fw = np.array(self._psd_welch_freqs[idx], dtype=np.float64)
                 Pw = np.array(self._psd_welch[idx], dtype=np.float64)
                 noisy_np, clean_np = self._whiten_with_welch(noisy_np, clean_np, fw, Pw)
-            elif self.whiten_mode == "model" and (self._psd_model is not None):
-                Pm = np.array(self._psd_model[idx], dtype=np.float64)
-                noisy_np, clean_np = self._whiten_with_model_psd(noisy_np, clean_np, Pm)
             else:
                 noisy_np, clean_np = self._whiten_train_like(noisy_np, clean_np)
 
-        # per-sample sigma
+        # per-sample sigma (computed in the same domain used as conditioning)
         if self.sigma_mode == "std":
             s = float(np.std(noisy_np.astype(np.float64)))
         elif self.sigma_mode == "mad":
@@ -216,7 +223,10 @@ class NoisyWaveDataset(Dataset):
         else:
             meta_bc = torch.zeros(0, length, dtype=torch.float32)
 
-        return clean, noisy, sigma, length, meta_bc
+        # mask (1 where valid)
+        mask = torch.ones_like(noisy, dtype=torch.float32)
+
+        return clean, noisy, sigma, mask, meta_bc
 
     def close(self):
         try:
@@ -236,10 +246,10 @@ class NoisyWaveDataset(Dataset):
         self.close()
 
 def pad_collate(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]]
+    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    clean_list, noisy_list, sigma_list, len_list, meta_list = zip(*batch)
-    Lmax = int(max(len_list))
+    clean_list, noisy_list, sigma_list, mask_list, meta_list = zip(*batch)
+    Lmax = int(max(x.shape[-1] for x in noisy_list))
 
     def _pad_left(x: torch.Tensor, target: int) -> torch.Tensor:
         pad = target - x.shape[-1]
@@ -247,9 +257,7 @@ def pad_collate(
 
     clean_pad = torch.stack([_pad_left(x, Lmax) for x in clean_list], dim=0)
     noisy_pad = torch.stack([_pad_left(x, Lmax) for x in noisy_list], dim=0)
-    mask_pad  = torch.stack([
-        _pad_left(torch.ones_like(x, dtype=torch.float32), Lmax) for x in noisy_list
-    ], dim=0)
+    mask_pad  = torch.stack([_pad_left(x, Lmax) for x in mask_list], dim=0)
 
     sigma = torch.stack([
         s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
