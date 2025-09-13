@@ -5,7 +5,7 @@ __pycache__/
 data/
 plots/
 models/
-
+checkpoints/
 logs/
 deploy_out/
 
