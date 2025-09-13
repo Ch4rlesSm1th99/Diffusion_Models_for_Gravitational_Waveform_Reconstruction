@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import json
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from models import UNet1D, CustomDiffusion
 
 def _tail_mask(L: int, fs: float, secs: float = 0.8):
@@ -37,29 +37,6 @@ def _mad_std(x: np.ndarray) -> float:
     x64 = np.asarray(x, dtype=np.float64)
     return 1.4826 * np.median(np.abs(x64 - np.median(x64))) + 1e-24
 
-def _load_measurement_from_h5(h5_path: str, index: int):
-    with h5py.File(h5_path, "r") as f:
-        y = np.array(f["noisy"][index], dtype=np.float32)
-        clean = np.array(f["signal"][index], dtype=np.float32) if "signal" in f else None
-        fs = float(f.attrs.get("sampling_rate", 0.0)) or float(1.0 / f.attrs.get("delta_t", 1.0 / 4096.0))
-    return y, clean, fs
-
-def _load_measurement_from_npy(npy_path: str, fs: float):
-    y = np.load(npy_path).astype(np.float32).ravel()
-    return y, None, fs
-
-def _pick_sigma(y: np.ndarray, mode: str, fixed: float) -> float:
-    y64 = np.asarray(y, dtype=np.float64)
-    if mode == "std":
-        s = float(np.std(y64))
-    elif mode == "mad":
-        s = float(_mad_std(y64))
-    elif mode == "fixed":
-        s = float(fixed)
-    else:
-        raise ValueError(f"unknown sigma-mode: {mode}")
-    return s  # no clamping here --> fallback is handled in main()
-
 def _reduce_to_one_channel(x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 3 and x.size(1) > 1:
         return x[:, :1, :]
@@ -78,9 +55,86 @@ def _corr_np(a: np.ndarray, b: np.ndarray) -> float:
     den = np.sqrt((a * a).sum() * (b * b).sum()) + 1e-30
     return float((a * b).sum() / den)
 
-# whitening modes
+# HDF5 / input loaders
+def _load_measurement_from_h5(h5_path: str, index: int):
+    """
+    Returns (y, clean, fs, P_model, (fw, Pw), meta_dict).
+    meta_dict keys (if present): 'mass1','mass2','spin1z','spin2z','q','chirp_mass','snr','epoch',...
+    """
+    meta = {}
+    with h5py.File(h5_path, "r") as f:
+        y = np.array(f["noisy"][index], dtype=np.float32)
+        clean = np.array(f["signal"][index], dtype=np.float32) if "signal" in f else None
+        fs = float(f.attrs.get("sampling_rate", 0.0)) or float(1.0 / f.attrs.get("delta_t", 1.0 / 4096.0))
+
+        # optional PSDs
+        P_model = None
+        if "psd_model" in f:
+            P_model = np.array(f["psd_model"][index], dtype=np.float64)
+        elif "psd" in f:  # legacy name
+            P_model = np.array(f["psd"][index], dtype=np.float64)
+        fw = Pw = None
+        if ("psd_welch" in f) and ("psd_welch_freqs" in f):
+            Pw = np.array(f["psd_welch"][index], dtype=np.float64)
+            fw = np.array(f["psd_welch_freqs"][index], dtype=np.float64)
+
+        # metadata (only grab what exists)
+        for k in ["mass1","mass2","spin1z","spin2z","q","chirp_mass","snr","epoch",
+                  "label_m1","label_m2","label_s1","label_s2"]:
+            if k in f:
+                try:
+                    meta[k] = float(np.array(f[k][index]).reshape(()))
+                except Exception:
+                    pass
+    return y, clean, fs, P_model, (fw, Pw), meta
+
+def _load_measurement_from_npy(npy_path: str, fs: float):
+    y = np.load(npy_path).astype(np.float32).ravel()
+    return y, None, fs, None, (None, None), {}
+
+# meta stack (labels) builder
+def _meta_to_stack(meta: dict, L: int, cond_in_ch: int, M_SCALE: float, Q_SCALE: float) -> Optional[np.ndarray]:
+    """
+    Build [C_meta, L] from metadata in the fixed order:
+      m1, m2, s1, s2, q, chirp_mass
+    Spins left as-is; masses & chirp_mass / M_SCALE; q / Q_SCALE.
+    """
+    C_needed = max(0, cond_in_ch - 1)
+    if C_needed <= 0:
+        return None
+
+    def _tile(v: float): return np.full((L,), float(v), dtype=np.float32)
+
+    m1 = _tile(meta.get("mass1", 0.0) / max(M_SCALE, 1e-9))
+    m2 = _tile(meta.get("mass2", 0.0) / max(M_SCALE, 1e-9))
+    s1 = _tile(meta.get("spin1z", 0.0))
+    s2 = _tile(meta.get("spin2z", 0.0))
+    qv = meta.get("q", 0.0)
+    if not np.isfinite(qv): qv = 0.0
+    q  = _tile(min(max(qv, 0.0), Q_SCALE) / max(Q_SCALE, 1e-9))
+    mc = _tile(meta.get("chirp_mass", 0.0) / max(M_SCALE, 1e-9))
+
+    base = [m1, m2, s1, s2, q, mc]
+    arr = np.stack(base[:C_needed], axis=0) if C_needed > 0 else None
+    if arr is not None and arr.shape[0] < C_needed:
+        pad = np.zeros((C_needed - arr.shape[0], L), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=0)
+    return arr
+
+# --------- sigma & whitening helpers ----------------------
+def _pick_sigma(y: np.ndarray, mode: str, fixed: float) -> float:
+    y64 = np.asarray(y, dtype=np.float64)
+    if mode == "std":
+        s = float(np.std(y64))
+    elif mode == "mad":
+        s = float(_mad_std(y64))
+    elif mode == "fixed":
+        s = float(fixed)
+    else:
+        raise ValueError(f"unknown sigma-mode: {mode}")
+    return s
+
 def _whiten_pair_train_like(y: np.ndarray, x: Optional[np.ndarray], fs: float) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
-    """Match training: FFT--> abs(Y)^2 --> 9-tap moving-average smoothing --> floor --> divide magnitude."""
     from numpy.fft import rfft, irfft
     L = len(y)
     y64 = y.astype(np.float64) - float(np.mean(y, dtype=np.float64))
@@ -104,7 +158,6 @@ def _dewhiten_train_like(sig: np.ndarray, P: np.ndarray) -> np.ndarray:
     return irfft(Xw * np.sqrt(P + 1e-12), n=L)
 
 def _whiten_pair_welch(y: np.ndarray, x: Optional[np.ndarray], fs: float) -> Tuple[np.ndarray, Optional[np.ndarray], Tuple[np.ndarray,np.ndarray]]:
-    """Welch estimate with interpolation."""
     from scipy.signal import welch
     from numpy.fft import rfft, irfft, rfftfreq
     L = len(y)
@@ -125,6 +178,32 @@ def _dewhiten_welch(sig: np.ndarray, freqs_P: Tuple[np.ndarray,np.ndarray], fs: 
     L = len(sig)
     Xw = rfft(sig)
     return irfft(Xw * np.sqrt(P + 1e-12), n=L)
+
+def _interp_psd_for_length(P: np.ndarray, L_src: int, L_tgt: int, fs: float) -> np.ndarray:
+    from numpy.fft import rfftfreq
+    if L_src == (L_tgt // 2 + 1):
+        return P.astype(np.float64)
+    f_src = rfftfreq(L_src * 2 - 2, 1.0 / fs)
+    f_tgt = rfftfreq(L_tgt, 1.0 / fs)
+    return np.interp(f_tgt, f_src, P, left=P[0], right=P[-1]).astype(np.float64)
+
+def _whiten_pair_model(y: np.ndarray, x: Optional[np.ndarray], P_model: np.ndarray, fs: float):
+    from numpy.fft import rfft, irfft
+    L = len(y)
+    P = _interp_psd_for_length(np.asarray(P_model, dtype=np.float64), len(P_model), L, fs)
+    Y = rfft(y.astype(np.float64))
+    y_w = irfft(Y / np.sqrt(P + 1e-12), n=L).astype(np.float32)
+    x_w = None
+    if x is not None:
+        X = rfft(x.astype(np.float64))
+        x_w = irfft(X / np.sqrt(P + 1e-12), n=L).astype(np.float32)
+    return y_w, x_w, P
+
+def _dewhiten_model(sig: np.ndarray, P: np.ndarray) -> np.ndarray:
+    from numpy.fft import rfft, irfft
+    Xw = rfft(sig)
+    return irfft(Xw * np.sqrt(P + 1e-12), n=len(sig))
+# --------------------------- end sigma + whitening section --------------------------
 
 #  SNR + scheduler helper funcs
 def snr_from_alpha_bar(alpha_bar: torch.Tensor) -> np.ndarray:
@@ -148,7 +227,6 @@ def _build_t_schedule(T: int, steps: int, device: torch.device, start_t: Optiona
         ts = torch.cat([ts, torch.tensor([0], device=device)])
     return ts
 
-# guidance schedule (time-dependent CFG) --> conditional vs. unconditional
 def _cfg_weight(i: int, N: int, mode: str, wmax: float, center: float, width: float) -> float:
     if N <= 1:
         s = 1.0
@@ -234,15 +312,16 @@ def _save_plot(t, y, xhat, clean, outpng, delta_t, sigma_scalar, xcorr_window_sa
         nmae_clean = mae / (float(np.mean(np.abs(clean_a[mask]))) + 1e-12)
         nmae_sigma = mae / (float(sigma_scalar) + 1e-12)
         print(f"[scores(xcorr)win -80ms,+40ms] MAE={mae:.3e} NMAE_clean={nmae_clean:.3e} NMAE_sigma={nmae_sigma:.3e}")
-        with open(base + "_xcorr_scores.txt", "w") as fh:
-            fh.write(f"MAE,{mae}\nNMAE_clean,{nmae_clean}\nNMAE_sigma,{nmae_sigma}\n")
 
-# proxy test ONE-STEP
+# proxy (one-step)
 @torch.no_grad()
-def one_step_proxy_like_test_infer(model, diffusion, clean_norm: torch.Tensor,
-                                   noisy_norm: torch.Tensor, sigma_scalar: float,
+def one_step_proxy_like_test_infer(model, diffusion,
+                                   clean_norm: torch.Tensor,
+                                   cond_stack: torch.Tensor,
+                                   sigma_scalar: float,
                                    target_snr: float, device: torch.device,
-                                   in_ch: int, cfg_scale: float,
+                                   in_ch: int, cond_in_ch: int, use_selfcond: bool,
+                                   cfg_scale: float, drop_y_only: bool,
                                    cond_scale: float = 1.0,
                                    eps_scale: float = 1.0,
                                    pred_type: str = "eps",
@@ -252,24 +331,29 @@ def one_step_proxy_like_test_infer(model, diffusion, clean_norm: torch.Tensor,
     t_pick = int(np.argmin(np.abs(snr_ts - target_snr)))
     t = torch.full((1,), t_pick, dtype=torch.long, device=device)
 
-    x_t, _ = diffusion.q_sample(clean_norm, t)  # diffuse the clean (proxy)
+    x_t, _ = diffusion.q_sample(clean_norm, t)
+    x0_sc = torch.zeros_like(x_t) if use_selfcond else None
 
-    x0_sc = torch.zeros_like(x_t) if in_ch >= 3 else None
+    y_channel = cond_stack[:, :1, :]
+    meta_channels = cond_stack[:, 1:, :] if cond_stack.size(1) > 1 else None
+    y_used = cond_scale * y_channel
+    cond_used = torch.cat([y_used, meta_channels], dim=1) if meta_channels is not None else y_used
 
-    def _make_in(x_t_, y_, sc_):
-        if in_ch >= 3:
-            return torch.cat([x_t_, y_, sc_], dim=1)
-        elif in_ch == 2:
-            return torch.cat([x_t_, y_], dim=1)
+    def _make_in(x_t_, cond_, sc_):
+        if use_selfcond:
+            return torch.cat([x_t_, cond_, sc_], dim=1)
         else:
-            return x_t_
+            return torch.cat([x_t_, cond_], dim=1)
 
-    y_used = cond_scale * noisy_norm
     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-        net_in_c = _make_in(x_t, y_used, x0_sc)
+        net_in_c = _make_in(x_t, cond_used, x0_sc)
         out_c = model(net_in_c, t)
         if cfg_scale != 1.0:
-            net_in_u = _make_in(x_t, torch.zeros_like(y_used), x0_sc)
+            if drop_y_only and (meta_channels is not None):
+                cond_u = torch.cat([torch.zeros_like(y_used), meta_channels], dim=1)
+            else:
+                cond_u = torch.zeros_like(cond_used)
+            net_in_u = _make_in(x_t, cond_u, x0_sc)
             out_u = model(net_in_u, t)
             out = out_u + cfg_scale * (out_c - out_u)
         else:
@@ -286,28 +370,30 @@ def one_step_proxy_like_test_infer(model, diffusion, clean_norm: torch.Tensor,
 
     return x0_hat_norm * torch.tensor(sigma_scalar, device=device).view(1, 1, 1)
 
-# DDIM SAMPLER (CURRENTLY BUGGED)
+# -------------- DDIM sampler -------------------
 @torch.no_grad()
-def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, eta: float,
+def ddim_sample(model, diffusion, cond_stack: torch.Tensor,
+                T: int, steps: int, eta: float,
                 device: torch.device, length: int, debug: bool,
                 start_t: Optional[int], init_mode: str, x0_std_est: float,
                 dc_weight: float, cond_scale: float, eps_scale: float, pred_type: str,
-                in_ch: int, cfg_scale: float, selfcond_ema: float,
+                in_ch: int, cond_in_ch: int, use_selfcond: bool, cfg_scale: float,
                 cfg_mode: str, cfg_center: float, cfg_width: float, cfg_u_only_thresh: float,
                 oracle_init: bool = False, clean_norm_311: Optional[torch.Tensor] = None,
                 log_jsonl_path: Optional[str] = None, log_interval: int = 0,
                 xcorr_window_samp: int = 0, delta_t: float = 1.0,
-                amp: bool = False) -> torch.Tensor:
+                amp: bool = False, drop_y_only: bool = True) -> torch.Tensor:
 
-    # ensure log dir exists if logging is enabled
     if log_jsonl_path:
         os.makedirs(os.path.dirname(log_jsonl_path), exist_ok=True)
+        def _log(obj: dict):
+            with open(log_jsonl_path, "a") as fh:
+                fh.write(json.dumps(obj) + "\n")
+    else:
+        def _log(_): pass
 
-    def _log(obj: dict):
-        if not log_jsonl_path:
-            return
-        with open(log_jsonl_path, "a") as fh:
-            fh.write(json.dumps(obj) + "\n")
+    y_chan = cond_stack[:, :1, :]
+    meta = cond_stack[:, 1:, :] if cond_stack.size(1) > 1 else None
 
     t_schedule = _build_t_schedule(T=T, steps=steps, device=device, start_t=start_t)
     ab = diffusion.alpha_bar.to(device).clamp(1e-12, 1.0)
@@ -317,8 +403,7 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
     if oracle_init and (clean_norm_311 is not None):
         t0 = int(t_schedule[0].item())
         x_t, _ = diffusion.q_sample(clean_norm_311, torch.tensor([t0], device=device, dtype=torch.long))
-        if debug:
-            print(f"[debug] oracle-init enabled (t0={t0})")
+        if debug: print(f"[debug] oracle-init enabled (t0={t0})")
     else:
         if init_mode == "noise":
             x_t = torch.randn(1, 1, length, device=device)
@@ -327,11 +412,11 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
             x_t = std_init * torch.randn(1, 1, length, device=device)
         elif init_mode == "y-blend":
             z = torch.randn(1, 1, length, device=device)
-            x_t = torch.sqrt(ab_start) * y_norm_311 + torch.sqrt(1 - ab_start) * z
+            x_t = torch.sqrt(ab_start) * y_chan + torch.sqrt(1 - ab_start) * z
         else:
             raise ValueError(f"unknown init_mode: {init_mode}")
 
-    x0_sc = torch.zeros_like(x_t) if in_ch >= 3 else None
+    x0_sc = torch.zeros_like(x_t) if use_selfcond else None
 
     if debug:
         print(f"[debug] init_mode={init_mode}, x0_std_est={x0_std_est:.3f}, ab_start={ab_start.item():.6f}")
@@ -345,34 +430,32 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
         ab_t = ab[t_now]
         ab_prev = ab[int(t_schedule[i + 1].item())] if i + 1 < N else torch.tensor(1.0, device=device)
 
-        def _make_in(x_t_, y_, sc_):
-            if in_ch >= 3:
-                return torch.cat([x_t_, y_, sc_], dim=1)
-            elif in_ch == 2:
-                return torch.cat([x_t_, y_], dim=1)
-            else:
-                return x_t_
+        # scale *y only*; meta untouched
+        y_used = cond_scale * y_chan
+        cond_used = torch.cat([y_used, meta], dim=1) if meta is not None else y_used
 
-        y_used = cond_scale * y_norm_311
-
-        # scheduled CFG weight
+        # scheduled CFG
         w_t = _cfg_weight(i=i, N=N, mode=cfg_mode, wmax=cfg_scale, center=cfg_center, width=cfg_width)
 
-        # choose which passes to run
+        def _make_in(x_t_, cond_, sc_):
+            return torch.cat([x_t_, cond_, sc_], dim=1) if use_selfcond else torch.cat([x_t_, cond_], dim=1)
+
         out_c = None; out_u = None; have_u = False
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
             if w_t <= cfg_u_only_thresh:
-                net_in_u = _make_in(x_t, torch.zeros_like(y_used), x0_sc)
+                cond_u = torch.cat([torch.zeros_like(y_used), meta], dim=1) if (drop_y_only and meta is not None) else torch.zeros_like(cond_used)
+                net_in_u = _make_in(x_t, cond_u, x0_sc)
                 out_u = model(net_in_u, torch.full((1,), t_now, dtype=torch.long, device=device))
                 out = out_u; have_u = True
             elif abs(w_t - 1.0) <= 1e-6:
-                net_in_c = _make_in(x_t, y_used, x0_sc)
+                net_in_c = _make_in(x_t, cond_used, x0_sc)
                 out_c = model(net_in_c, torch.full((1,), t_now, dtype=torch.long, device=device))
                 out = out_c
             else:
-                net_in_c = _make_in(x_t, y_used, x0_sc)
+                net_in_c = _make_in(x_t, cond_used, x0_sc)
                 out_c = model(net_in_c, torch.full((1,), t_now, dtype=torch.long, device=device))
-                net_in_u = _make_in(x_t, torch.zeros_like(y_used), x0_sc)
+                cond_u = torch.cat([torch.zeros_like(y_used), meta], dim=1) if (drop_y_only and meta is not None) else torch.zeros_like(cond_used)
+                net_in_u = _make_in(x_t, cond_u, x0_sc)
                 out_u = model(net_in_u, torch.full((1,), t_now, dtype=torch.long, device=device))
                 out = out_u + w_t * (out_c - out_u); have_u = True
 
@@ -386,13 +469,10 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
             eps_hat = (x_t - torch.sqrt(ab_t) * x0_hat_norm) / torch.sqrt(torch.clamp(1 - ab_t, min=1e-12))
 
         if dc_weight > 0:
-            x0_hat_norm = (1 - dc_weight) * x0_hat_norm + dc_weight * y_norm_311
+            x0_hat_norm = (1 - dc_weight) * x0_hat_norm + dc_weight * y_chan
 
-        if in_ch >= 3:
-            if selfcond_ema <= 0:
-                x0_sc = x0_hat_norm.detach()
-            else:
-                x0_sc = (selfcond_ema * x0_sc + (1 - selfcond_ema) * x0_hat_norm).detach()
+        if use_selfcond:
+            x0_sc = x0_hat_norm.detach()
 
         # DDIM update
         if t_now == 0:
@@ -408,23 +488,12 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
             print(_stats(f"eps_hat (t={t_now})", eps_hat))
 
         # per-step log
-        do_log = (log_interval and (i % log_interval == 0)) or (log_interval and i == N - 1)
-        if do_log or debug:
-            if (out_c is not None) and (not have_u) and log_jsonl_path:
-                net_in_u2 = _make_in(x_t, torch.zeros_like(y_used), x0_sc)
-                out_u2 = model(net_in_u2, torch.full((1,), t_now, dtype=torch.long, device=device))
-            else:
-                out_u2 = out_u if have_u else None
-
-            cond_delta_rms = None
-            if (out_c is not None) and (out_u2 is not None):
-                d = (out_c - out_u2).reshape(-1)
-                cond_delta_rms = float(torch.linalg.norm(d) / (d.numel() ** 0.5))
-
+        if log_jsonl_path and ((i % max(1, log_interval) == 0) or (i == N - 1)):
+            # quick xcorr diag vs y
             xt_np = x_t.detach().cpu().numpy().reshape(-1)
-            y_np = y_norm_311.detach().cpu().numpy().reshape(-1)
+            y_np  = y_chan.detach().cpu().numpy().reshape(-1)
             if len(xt_np) and len(y_np):
-                win = xcorr_window_samp if xcorr_window_samp > 0 else min(len(xt_np) - 1, int(max(1.0, 0.25 / delta_t)))
+                win = min(len(xt_np) - 1, int(max(1.0, 0.25 / delta_t)))
                 k = _best_lag_by_xcorr(xt_np, y_np, max_shift=win)
                 if k < 0:
                     a = xt_np[-k:]; b = y_np[:len(xt_np) + k]
@@ -434,33 +503,19 @@ def ddim_sample(model, diffusion, y_norm_311: torch.Tensor, T: int, steps: int, 
                     a = xt_np; b = y_np
                 corr_lag = _corr_np(a, b)
             else:
-                k = 0; corr_lag = 0.0
-
-            with open(log_jsonl_path, "a") if log_jsonl_path else open(os.devnull, "w") as _:
-                pass
-            if log_jsonl_path:
-                with open(log_jsonl_path, "a") as fh:
-                    fh.write(json.dumps({
-                        "phase": "ddim_step",
-                        "i": i, "t": t_now,
-                        "i_norm": float(0.0 if N <= 1 else i/(N-1)),
-                        "alpha_bar": float(ab_t.item() if isinstance(ab_t, torch.Tensor) else ab_t),
-                        "cfg_mode": cfg_mode,
-                        "cfg_w_t": float(w_t),
-                        "cfg_scale": float(cfg_scale),
-                        "norm_pred_c": float(torch.linalg.norm(out_c).item()) if out_c is not None else None,
-                        "norm_pred_u": float(torch.linalg.norm(out_u2).item()) if out_u2 is not None else None,
-                        "cond_delta_rms": cond_delta_rms,
-                        "lag_best_samples": int(k),
-                        "lag_best_ms": float(k * delta_t * 1000.0),
-                        "corr_lag": corr_lag,
-                    }) + "\n")
+                corr_lag = 0.0
+            _log({
+                "phase":"ddim_step","i":i,"t":t_now,"i_norm":float(0.0 if N<=1 else i/(N-1)),
+                "alpha_bar":float(ab_t.item() if isinstance(ab_t, torch.Tensor) else ab_t),
+                "cfg_mode":cfg_mode,"cfg_w_t":float(w_t),"cfg_scale":float(cfg_scale),
+                "corr_lag":corr_lag
+            })
 
     return x_t  # = x0_hat_norm
 
 
 def main():
-    ap = argparse.ArgumentParser("Conditional deployment sampler (+self-cond & scheduled CFG)")
+    ap = argparse.ArgumentParser("Conditional deployment sampler (+self-cond & scheduled CFG, y | meta)")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--input-h5", type=str, help="HDF5 with 'noisy' (and optionally 'signal')")
     src.add_argument("--input-npy", type=str, help="1D npy array with the measurement")
@@ -485,10 +540,11 @@ def main():
     ap.add_argument("--sigma-mode", choices=["std", "mad", "fixed"], default="std")
     ap.add_argument("--sigma-fixed", type=float, default=1.0)
 
-    # whitening (match training by default)
+    # whitening
     ap.add_argument("--whiten", action="store_true")
-    ap.add_argument("--whiten-mode", choices=["train", "welch"], default="train",
-                    help="train: FFT+moving-average PSD (matches dataloader); welch: Welch PSD")
+    ap.add_argument("--whiten-mode", choices=["train", "welch", "model", "auto"], default="auto",
+                    help="train: FFT+moving-average PSD; welch/model: use per-sample PSD if available; "
+                         "auto prefers model->welch->train")
 
     # plotting / debug
     ap.add_argument("--plot", action="store_true")
@@ -508,31 +564,23 @@ def main():
     ap.add_argument("--eps-scale", type=float, default=1.0)
     ap.add_argument("--pred-type", choices=["eps", "x0"], default="eps")
 
-    # CFG + self-conditioning at inference
+    # CFG + self-conditioning
     ap.add_argument("--cfg-scale", type=float, default=1.5, help="Peak CFG weight (wmax). 1.0 = plain conditional")
-    ap.add_argument("--cfg-mode", choices=["const", "tophat", "gauss"], default="const",
-                    help="Time-dependent guidance schedule")
-    ap.add_argument("--cfg-center", type=float, default=0.70,
-                    help="Center of schedule in normalized step; 0=noisiest, 1=cleanest")
-    ap.add_argument("--cfg-width", type=float, default=0.12,
-                    help="For tophat: full width; for gauss: sigma; both in s-units")
-    ap.add_argument("--cfg-u-only-thresh", type=float, default=0.05,
-                    help="If w_t <= this, run unconditional-only (skip cond pass)")
-    ap.add_argument("--selfcond-ema", type=float, default=0.9, help="EMA for self-conditioning buffer; 0=last only")
+    ap.add_argument("--cfg-mode", choices=["const", "tophat", "gauss"], default="const")
+    ap.add_argument("--cfg-center", type=float, default=0.70)
+    ap.add_argument("--cfg-width", type=float, default=0.12)
+    ap.add_argument("--cfg-u-only-thresh", type=float, default=0.05)
+    ap.add_argument("--selfcond-ema", type=float, default=0.9)
 
     # oracle init
     ap.add_argument("--oracle-init", action="store_true",
                     help="Start from q_sample(clean_norm, start_t) (requires clean in HDF5)")
 
-    ap.add_argument("--run-tag", type=str, default=None,
-                    help="Title for filenames; if none, auto-generated from settings")
+    ap.add_argument("--run-tag", type=str, default=None)
+    ap.add_argument("--score-secs", type=float, default=0.8)
 
-    ap.add_argument("--score-secs", type=float, default=0.8,
-                    help="length (seconds) of tail window for corr/MAE scoring")
-
-    # inference nonsense
-    ap.add_argument("--use-ema", action="store_true",
-                    help="If checkpoint has EMA, use it (ideally recommended)")
+    # AMP + EMA use
+    ap.add_argument("--use-ema", action="store_true", help="If checkpoint has EMA, use it (recommended)")
     ap.add_argument("--no-use-ema", dest="use_ema", action="store_false")
     ap.set_defaults(use_ema=True)
     ap.add_argument("--amp", action="store_true", help="Enable mixed precision inference on CUDA")
@@ -548,11 +596,11 @@ def main():
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    # load measurement
+    # load measurement (+ optional PSDs + meta)
     if args.input_h5:
-        y_raw, clean_raw, fs = _load_measurement_from_h5(args.input_h5, args.index)
+        y_raw, clean_raw, fs, P_model_in, (fw_in, Pw_in), meta_dict = _load_measurement_from_h5(args.input_h5, args.index)
     else:
-        y_raw, clean_raw, fs = _load_measurement_from_npy(args.input_npy, args.fs)
+        y_raw, clean_raw, fs, P_model_in, (fw_in, Pw_in), meta_dict = _load_measurement_from_npy(args.input_npy, args.fs)
 
     L = len(y_raw)
     t = np.arange(L) / fs
@@ -562,73 +610,31 @@ def main():
             print(_stats("clean_raw", clean_raw))
         print(f"[debug] fs={fs}, L={L}, dt={1.0 / fs:.6e}")
 
-    # whitening (must match training)
-    P_train = None; freqs_P = None
-    if args.whiten:
-        if args.whiten_mode == "train":
-            y_for_cond, clean_for_cond, P_train = _whiten_pair_train_like(y_raw, clean_raw, fs)
-            if args.debug:
-                print(_stats("y_white(train)", y_for_cond))
-                if clean_for_cond is not None:
-                    print(_stats("clean_white(train)", clean_for_cond))
-        else:
-            y_for_cond, clean_for_cond, freqs_P = _whiten_pair_welch(y_raw, clean_raw, fs)
-            if args.debug:
-                print(_stats("y_white(welch)", y_for_cond))
-                if clean_for_cond is not None:
-                    print(_stats("clean_white(welch)", clean_for_cond))
-    else:
-        y_for_cond = y_raw
-        clean_for_cond = clean_raw
-
-    # sigma from SAME domain as conditioning
-    sigma = _pick_sigma(y_for_cond, args.sigma_mode, args.sigma_fixed)
-
-    # ---- fallback sigma if degenerate (e.g., all-zeros measurement)
-    fallback = {"train": 2.914e-12, "welch": 2.914e-16}  # dataset medians; can be overridden by fallback_sigma.json
-    try:
-        with open(os.path.join(os.path.dirname(args.model), "fallback_sigma.json"), "r") as fh:
-            fb = json.load(fh)
-            if "train" in fb and "median" in fb["train"]:
-                fallback["train"] = float(fb["train"]["median"])
-            if "welch" in fb and "median" in fb["welch"]:
-                fallback["welch"] = float(fb["welch"]["median"])
-    except Exception:
-        pass
-
-    if (not np.isfinite(sigma)) or (sigma < 1e-20):
-        sigma = fallback[args.whiten_mode]
-        print(f"[warn] sigma invalid/too small; using fallback={sigma:.3e} ({args.whiten_mode})")
-
-    if args.debug:
-        print(f"[debug] sigma_mode={args.sigma_mode}, sigma={sigma:.3e}")
-        print(f"[debug] SNR(y_for_cond)~mean(|y|)/sigma -> {np.mean(np.abs(y_for_cond)) / sigma:.3e}")
-
-    # normalized conditioning (match training domain)
-    y_norm = (y_for_cond / sigma).astype(np.float32)
-    y_norm_311 = torch.from_numpy(y_norm).to(device).view(1, 1, -1)
-    clean_norm_311 = None
-    if clean_for_cond is not None:
-        clean_norm_311 = torch.from_numpy((clean_for_cond / sigma).astype(np.float32)).to(device).view(1, 1, -1)
-
-    if args.debug:
-        print(_stats("y_norm", y_norm))
-
-    # load model + diffusion
+    # load model + diffusion + scales
     ckpt = torch.load(args.model, map_location=device)
     ck_args = ckpt.get("args", {})
     in_ch = ck_args.get("in_ch", 3)
+    cond_in_ch = ck_args.get("cond_in_ch", 1)
     base_ch = ck_args.get("base_ch", 64)
     time_dim = ck_args.get("time_dim", 128)
     depth = ck_args.get("depth", 3)
     T = ck_args.get("T", 1000)
+    drop_y_only = bool(ck_args.get("dropout_y_only", True))
+    use_selfcond = (in_ch == (1 + cond_in_ch + 1))
+
+    # dataset-adaptive meta scales (from training), with safe fallbacks
+    meta_scale = ck_args.get("meta_scale", {"M": 80.0, "q": 10.0})
+    M_SCALE = float(meta_scale.get("M", 80.0))
+    Q_SCALE = float(meta_scale.get("q", 10.0))
 
     model = UNet1D(
         in_ch=in_ch,
         base_ch=base_ch,
         time_dim=time_dim,
         depth=depth,
-        t_embed_max_time=max(0, T - 1),  # match normalized time embedding
+        t_embed_max_time=max(0, T - 1),
+        cond_in_ch=cond_in_ch,
+        use_selfcond=use_selfcond,
     ).to(device)
 
     state_loaded = False
@@ -638,14 +644,106 @@ def main():
             state_loaded = True
             print("[info] loaded EMA weights")
         except Exception as e:
-            print(f"[warn] EMA load failed ({e}); falling back to raw weights")
+            print(f"[warn] EMA load failed ({e}); falling back to raw weights]")
     if not state_loaded:
         model.load_state_dict(ckpt["model_state"], strict=True)
         print("[info] loaded raw weights")
 
     model.eval()
-    model.in_ch = in_ch
     diffusion = CustomDiffusion(T=T, device=device)
+
+    # ---- whitening (model -> welch -> train for AUTO) ----
+    P_train = None; freqs_P = None; P_model_used = None
+    whiten_kind_used = "raw"
+    if args.whiten:
+        mode = args.whiten_mode
+        if mode == "auto":
+            if P_model_in is not None:
+                y_for_cond, clean_for_cond, P_model_used = _whiten_pair_model(y_raw, clean_raw, P_model_in, fs)
+                whiten_kind_used = "model"
+            elif (fw_in is not None) and (Pw_in is not None):
+                from numpy.fft import rfft, irfft, rfftfreq
+                f_tgt = rfftfreq(L, 1.0 / fs)
+                P = np.interp(f_tgt, fw_in, Pw_in, left=Pw_in[0], right=Pw_in[-1])
+                Y = np.fft.rfft(y_raw.astype(np.float64))
+                y_for_cond = np.fft.irfft(Y/np.sqrt(P+1e-12), n=L).astype(np.float32)
+                if clean_raw is not None:
+                    X = np.fft.rfft(clean_raw.astype(np.float64))
+                    clean_for_cond = np.fft.irfft(X/np.sqrt(P+1e-12), n=L).astype(np.float32)
+                else:
+                    clean_for_cond = None
+                freqs_P = (f_tgt, P)
+                whiten_kind_used = "welch"
+            else:
+                y_for_cond, clean_for_cond, P_train = _whiten_pair_train_like(y_raw, clean_raw, fs)
+                whiten_kind_used = "train"
+        elif mode == "model":
+            if P_model_in is None:
+                y_for_cond, clean_for_cond, P_train = _whiten_pair_train_like(y_raw, clean_raw, fs)
+                whiten_kind_used = "train"
+            else:
+                y_for_cond, clean_for_cond, P_model_used = _whiten_pair_model(y_raw, clean_raw, P_model_in, fs)
+                whiten_kind_used = "model"
+        elif mode == "welch":
+            y_for_cond, clean_for_cond, freqs_P = _whiten_pair_welch(y_raw, clean_raw, fs)
+            whiten_kind_used = "welch"
+        else:  # 'train'
+            y_for_cond, clean_for_cond, P_train = _whiten_pair_train_like(y_raw, clean_raw, fs)
+            whiten_kind_used = "train"
+        if args.debug:
+            print(_stats(f"y_white({whiten_kind_used})", y_for_cond))
+            if clean_for_cond is not None:
+                print(_stats(f"clean_white({whiten_kind_used})", clean_for_cond))
+    else:
+        y_for_cond = y_raw
+        clean_for_cond = clean_raw
+        whiten_kind_used = "raw"
+
+    # sigma in same domain as conditioning
+    sigma = _pick_sigma(y_for_cond, args.sigma_mode, args.sigma_fixed)
+
+    # fallback sigma if degenerate
+    fallback = {"train": 2.914e-12, "welch": 2.914e-16, "model": 2.914e-16, "raw": 2.914e-12}
+    try:
+        with open(os.path.join(os.path.dirname(args.model), "fallback_sigma.json"), "r") as fh:
+            fb = json.load(fh)
+            for k in list(fallback.keys()):
+                if k in fb and "median" in fb[k]:
+                    fallback[k] = float(fb[k]["median"])
+    except Exception:
+        pass
+    if (not np.isfinite(sigma)) or (sigma < 1e-20):
+        sigma = fallback.get(whiten_kind_used, fallback["train"])
+        print(f"[warn] sigma invalid/too small; using fallback={sigma:.3e} (mode={whiten_kind_used})")
+
+    if args.debug:
+        print(f"[debug] whitening resolved to: {whiten_kind_used}")
+        print(f"[debug] sigma_mode={args.sigma_mode}, sigma={sigma:.3e}")
+        print(f"[debug] SNR(y_for_cond)~mean(|y|)/sigma -> {np.mean(np.abs(y_for_cond)) / sigma:.3e}")
+
+    # normalized y; meta uses dataset-adaptive fixed scales (not sigma)
+    y_norm = (y_for_cond / sigma).astype(np.float32)
+    y_norm_311 = torch.from_numpy(y_norm).to(device).view(1, 1, -1)
+    clean_norm_311 = None
+    if clean_for_cond is not None:
+        clean_norm_311 = torch.from_numpy((clean_for_cond / sigma).astype(np.float32)).to(device).view(1, 1, -1)
+    if args.debug:
+        print(_stats("y_norm", y_norm))
+
+    # build conditional stack
+    if cond_in_ch <= 1:
+        cond_stack = y_norm_311
+    else:
+        meta_arr = None
+        if args.input_h5:
+            try:
+                meta_arr = _meta_to_stack(meta_dict, L=L, cond_in_ch=cond_in_ch, M_SCALE=M_SCALE, Q_SCALE=Q_SCALE)
+            except Exception as e:
+                print(f"[warn] meta stack build failed: {e}")
+        if meta_arr is None:
+            meta_arr = np.zeros((cond_in_ch - 1, L), dtype=np.float32)
+        meta_311 = torch.from_numpy(meta_arr).to(device).unsqueeze(0)   # [1, C_meta, L]
+        cond_stack = torch.cat([y_norm_311, meta_311], dim=1)
 
     # choose start_t
     start_t = t_for_target_snr(diffusion, args.start_snr) if (args.start_snr is not None) else args.start_t
@@ -674,15 +772,15 @@ def main():
     print(f"[info] device={device} steps={args.steps}/{T} eta={args.eta} "
           f"sigma_mode={args.sigma_mode} whiten={'on' if args.whiten else 'off'} mode={args.whiten_mode} seed={args.seed}")
     print(f"[info] start_t={start_t_eff} (SNR≈{start_snr_eff:.2f}) init_mode={args.init_mode} "
-          f"pred_type={args.pred_type} in_ch={in_ch} selfcond_ema={args.selfcond_ema} AMP={args.amp}")
+          f"pred_type={args.pred_type} in_ch={in_ch} cond_in_ch={cond_in_ch} selfcond={use_selfcond} AMP={args.amp}")
     print(f"[info] CFG: mode={args.cfg_mode} wmax={args.cfg_scale} center={args.cfg_center} "
-          f"width={args.cfg_width} u_only_thresh={args.cfg_u_only_thresh}")
+          f"width={args.cfg_width} u_only_thresh={args.cfg_u_only_thresh} drop_y_only={drop_y_only}")
 
-    # iterative sampling (DDIM)
+    # iterative sampling (DDIM): **noising→denoising** schedule
     x0_hat_norm = ddim_sample(
         model=model,
         diffusion=diffusion,
-        y_norm_311=y_norm_311,
+        cond_stack=cond_stack,
         T=T,
         steps=args.steps,
         eta=args.eta,
@@ -697,8 +795,9 @@ def main():
         eps_scale=args.eps_scale,
         pred_type=args.pred_type,
         in_ch=in_ch,
+        cond_in_ch=cond_in_ch,
+        use_selfcond=use_selfcond,
         cfg_scale=args.cfg_scale,
-        selfcond_ema=args.selfcond_ema,
         cfg_mode=args.cfg_mode,
         cfg_center=args.cfg_center,
         cfg_width=args.cfg_width,
@@ -710,118 +809,98 @@ def main():
         xcorr_window_samp=args.xcorr_window_samp,
         delta_t=1.0 / float(fs),
         amp=args.amp,
+        drop_y_only=drop_y_only,
     )
 
     x0_hat_raw = (x0_hat_norm * torch.tensor(sigma, device=device).view(1, 1, 1)).detach().cpu().numpy().ravel()
     if args.debug:
         print(_stats("x0_hat_raw (iterative, whitened-domain)", x0_hat_raw))
 
-    # de-whiten if used
+    # de-whiten if used (mirror whitening path)
     if args.whiten:
-        if args.whiten_mode == "train":
+        if whiten_kind_used == "train":
             x0_hat_raw = _dewhiten_train_like(x0_hat_raw, P_train)
-        else:
+        elif whiten_kind_used == "welch":
             x0_hat_raw = _dewhiten_welch(x0_hat_raw, freqs_P, fs)
-        if args.debug:
-            print(_stats("x0_hat_raw (de-whitened to strain)", x0_hat_raw))
+        elif whiten_kind_used == "model":
+            x0_hat_raw = _dewhiten_model(x0_hat_raw, P_model_used)
 
     # save tagged
     os.makedirs(args.outdir, exist_ok=True)
-
-    recon_path = os.path.join(args.outdir, f"reconstruction_{tag_iter}.npy")
-    meas_path = os.path.join(args.outdir, f"measurement_{tag_iter}.npy")
-    overlay_path = os.path.join(args.outdir, f"overlay_{tag_iter}.png")
-
+    recon_path  = os.path.join(args.outdir, f"reconstruction_{tag_iter}.npy")
+    meas_path   = os.path.join(args.outdir, f"measurement_{tag_iter}.npy")
+    overlay_path= os.path.join(args.outdir, f"overlay_{tag_iter}.png")
     np.save(recon_path, x0_hat_raw)
     np.save(meas_path, y_raw)
 
-    # plots
     if args.plot:
-        _save_plot(
-            t, y_raw, x0_hat_raw,
-            clean_raw if (clean_raw is not None and len(clean_raw) == L) else None,
-            overlay_path,
-            delta_t=1.0 / fs, sigma_scalar=sigma, xcorr_window_samp=args.xcorr_window_samp
-        )
+        _save_plot(t, y_raw, x0_hat_raw,
+                   clean_raw if (clean_raw is not None and len(clean_raw) == L) else None,
+                   overlay_path, delta_t=1.0 / fs, sigma_scalar=sigma, xcorr_window_samp=args.xcorr_window_samp)
 
-    # ---- metrics: last `score-secs` on tail ----
+    # metrics on tail
     metrics = {
-        "tag": tag_iter,
-        "fs": fs,
-        "score_secs": args.score_secs,
-        "whiten": bool(args.whiten),
-        "whiten_mode": args.whiten_mode,
-        "sigma_mode": args.sigma_mode,
-        "cfg_scale": args.cfg_scale,
-        "cfg_mode": args.cfg_mode,
-        "cfg_center": args.cfg_center,
-        "cfg_width": args.cfg_width,
-        "cond_scale": args.cond_scale,
-        "steps": args.steps,
-        "start_t": int(start_t_eff),
+        "tag": tag_iter, "fs": fs, "score_secs": args.score_secs,
+        "whiten": bool(args.whiten), "whiten_mode": args.whiten_mode,
+        "whiten_kind_used": whiten_kind_used,
+        "sigma_mode": args.sigma_mode, "cfg_scale": args.cfg_scale, "cfg_mode": args.cfg_mode,
+        "cfg_center": args.cfg_center, "cfg_width": args.cfg_width, "cond_scale": args.cond_scale,
+        "steps": args.steps, "start_t": int(start_t_eff),
+        "cond_in_ch": int(cond_in_ch), "drop_y_only": bool(drop_y_only)
     }
 
-    # strain-domain
     if (clean_raw is not None) and (len(clean_raw) == L):
         m_strain = _score_last_window(x0_hat_raw, clean_raw, fs, secs=args.score_secs)
         metrics["strain"] = m_strain
 
-    # whitened-domain (only if whitening was used and we had clean_for_cond)
     if args.whiten and (clean_for_cond is not None):
         x0_hat_norm_np = x0_hat_norm.detach().cpu().numpy().ravel().astype(np.float64)
-        x0_hat_white = x0_hat_norm_np * float(sigma)  # un-normalize but keep whitened domain
+        x0_hat_white = x0_hat_norm_np * float(sigma)
         m_white = _score_last_window(x0_hat_white, clean_for_cond, fs, secs=args.score_secs)
         metrics["whitened"] = m_white
 
     metrics_path = os.path.join(args.outdir, f"metrics_{tag_iter}.json")
     with open(metrics_path, "w") as fh:
         json.dump(metrics, fh, indent=2)
-    print(f"[done] wrote metrics:                {metrics_path}")
+    print(f"[done] wrote metrics: {metrics_path}")
 
-    # proxy save if tagged
+    # proxy (optional)
     if args.one_step_proxy and (clean_for_cond is not None):
-        clean_norm = torch.from_numpy((clean_for_cond / sigma).astype(np.float32)).to(device).view(1, 1, -1)
-
         x0_hat_proxy = one_step_proxy_like_test_infer(
             model=model, diffusion=diffusion,
-            clean_norm=clean_norm, noisy_norm=y_norm_311,
+            clean_norm=clean_norm_311, cond_stack=cond_stack,
             sigma_scalar=sigma, target_snr=args.target_snr, device=device,
-            in_ch=in_ch, cfg_scale=args.cfg_scale,
+            in_ch=in_ch, cond_in_ch=cond_in_ch, use_selfcond=use_selfcond,
+            cfg_scale=args.cfg_scale, drop_y_only=drop_y_only,
             cond_scale=args.cond_scale, eps_scale=args.eps_scale, pred_type=args.pred_type,
             amp=args.amp
         ).detach().cpu().numpy().ravel()
 
-        # de-whiten proxy to original strain domain (to match clean_raw)
         x0_hat_proxy_raw = x0_hat_proxy
         if args.whiten:
-            if args.whiten_mode == "train":
+            if whiten_kind_used == "train":
                 x0_hat_proxy_raw = _dewhiten_train_like(x0_hat_proxy_raw, P_train)
-            else:
+            elif whiten_kind_used == "welch":
                 x0_hat_proxy_raw = _dewhiten_welch(x0_hat_proxy_raw, freqs_P, fs)
+            elif whiten_kind_used == "model":
+                x0_hat_proxy_raw = _dewhiten_model(x0_hat_proxy_raw, P_model_used)
 
         recon_proxy_path = os.path.join(args.outdir, f"reconstruction_{tag_proxy}.npy")
-        meas_proxy_path = os.path.join(args.outdir, f"measurement_{tag_proxy}.npy")
+        meas_proxy_path  = os.path.join(args.outdir, f"measurement_{tag_proxy}.npy")
         overlay_proxy_path = os.path.join(args.outdir, f"overlay_{tag_proxy}.png")
-
         np.save(recon_proxy_path, x0_hat_proxy_raw)
         np.save(meas_proxy_path, y_raw)
-
         if args.plot:
-            _save_plot(
-                t, y_raw, x0_hat_proxy_raw, clean_raw,
-                overlay_proxy_path,
-                delta_t=1.0 / fs, sigma_scalar=sigma, xcorr_window_samp=args.xcorr_window_samp
-            )
+            _save_plot(t, y_raw, x0_hat_proxy_raw, clean_raw, overlay_proxy_path,
+                       delta_t=1.0 / fs, sigma_scalar=sigma, xcorr_window_samp=args.xcorr_window_samp)
 
-        print(f"[done] wrote proxy reconstruction:     {recon_proxy_path}")
-        print(f"[done] wrote proxy measurement:        {meas_proxy_path}")
-        if args.plot:
-            print(f"[done] wrote proxy overlays:          {overlay_proxy_path} (+ _xcorr*.png & _xcorr_scores.txt)")
+        print(f"[done] wrote proxy reconstruction: {recon_proxy_path}")
+        print(f"[done] wrote proxy measurement:    {meas_proxy_path}")
 
     print(f"[done] wrote iterative reconstruction: {recon_path}")
     print(f"[done] wrote measurement:              {meas_path}")
     if args.plot:
-        print(f"[done] wrote iterative overlays:       {overlay_path} (+ _xcorr*.png & _xcorr_scores.txt)")
+        print(f"[done] wrote iterative overlays:       {overlay_path}")
 
 if __name__ == "__main__":
     main()
