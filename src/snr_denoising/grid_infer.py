@@ -4,30 +4,15 @@ import torch
 import inference as inf
 
 """
-Evaluate a (fixed-data–trained) model across a grid dataset and produce
-per-(m1, m2) performance heatmaps and tables.
+Evaluate a (fixed-data–trained) model across the *discrete* (m1, m2) values
+present in a dataset and produce per-(m1, m2) performance heatmaps + tables.
 
-Examples
---------
-# Use settings from sweep_infer.py, show MAE values scaled by 1e-22 in each cell:
-python grid_infer.py \
-  --input-h5 /path/to/grid_data.h5 \
-  --model /path/to/fixed_model/latest_model/model_diffusion.pth \
-  --from-sweep /path/to/sweep_dir \
-  --outdir /path/to/out_grid_eval \
-  --grid-steps 10 --per-cell 4 --unordered \
-  --whiten --whiten-mode auto --sigma-mode std --amp \
-  --win full --align xcorr --align-max-shift-s 0.02 \
-  --metrics mae \
-  --annot value --annot-fmt .2f --annot-div 1e-22 \
-  --discrete-axes --gridlines --tick-every 2 --tick-fmt .0f \
-  --title-mae "Mean MAE Title"
-
-# Hide all numbers inside cells:
-#   --annot none
+- Axes are *discrete* and derived from the unique mass values in the file.
+- Bin edges are midpoints between adjacent mass values; each cell = one mass value.
+- If there are many unique masses, axis tick labels are thinned automatically.
 """
 
-# helper funcs #
+
 def _objective(m_strain, m_white):
     r_s = m_strain.get("corr_last", 0.0) if m_strain else 0.0
     r_w = m_white.get("corr_last", 0.0) if m_white else 0.0
@@ -184,10 +169,41 @@ def _parse_sweep_best(sweep_dir):
         except Exception: pass
     return out
 
-# ---------- main grid evaluation ----- #
+# discrete grid utils
+
+def _unique_sorted(vals, rdec=6):
+    u = np.unique(np.round(np.asarray(vals, dtype=np.float64), rdec))
+    u.sort()
+    return u
+
+def _midpoint_edges_from_values(vals, rdec=6):
+    u = _unique_sorted(vals, rdec=rdec)
+    if len(u) < 2:
+        step = 1.0
+        edges = np.array([u[0]-0.5, u[0]+0.5], dtype=np.float64)
+    else:
+        diffs = np.diff(u)
+        step = float(np.median(diffs))
+        mids = 0.5*(u[:-1] + u[1:])
+        edges = np.concatenate([[u[0]-step/2], mids, [u[-1]+step/2]]).astype(np.float64)
+    centers = u.astype(np.float64)
+    return edges, centers
+
+def _choose_tick_values(centers, max_labels):
+    n = len(centers)
+    if n <= max_labels:
+        idx = np.arange(n)
+    else:
+        step = int(np.ceil(n / max_labels))
+        idx = np.arange(0, n, step)
+        if idx[-1] != n-1:
+            idx = np.append(idx, n-1)
+    return centers[idx]
+
+# --------------- main ------------- #
 
 def main():
-    ap = argparse.ArgumentParser("Evaluate model across (m1,m2) grid with fixed inference knobs")
+    ap = argparse.ArgumentParser("Evaluate model across (m1,m2) grid with discrete axes from dataset")
     ap.add_argument("--input-h5", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--outdir", required=True)
@@ -214,12 +230,9 @@ def main():
     ap.add_argument("--sigma-mode", default="std", choices=["std","mad","fixed"])
     ap.add_argument("--sigma-fixed", type=float, default=1.0)
 
-    # grid selection
-    ap.add_argument("--grid-steps", type=int, default=10)
-    ap.add_argument("--per-cell", type=int, default=4)
-    ap.add_argument("--min-per-cell", type=int, default=1)
+    # dataset pairing
     ap.add_argument("--unordered", action="store_true",
-                    help="evaluate only m2<=m1 (lower triangle) by sorting (m1,m2) within each sample")
+                    help="Sort (m1,m2) within each sample so m1>=m2 (lower triangle in data).")
 
     # scoring window + alignment
     ap.add_argument("--win", choices=["full","tail","merger"], default="full")
@@ -236,29 +249,27 @@ def main():
     ap.add_argument("--metrics", choices=["mae","corr","mae+corr"], default="mae")
 
     # plot customization
-    ap.add_argument("--xlabel", default=None)
-    ap.add_argument("--ylabel", default=None)
+    ap.add_argument("--xlabel", default="M1 (Solar Mass Units)")
+    ap.add_argument("--ylabel", default="M2 (Solar Mass Units)")
     ap.add_argument("--title-corr", dest="title_corr", default="Mean correlation (strain)")
-    ap.add_argument("--title-mae", dest="title_mae",   default="Mean MAE (strain)")
+    ap.add_argument("--title-mae",  dest="title_mae",  default="Mean MAE (strain)")
     ap.add_argument("--annot", choices=["count","value","none"], default="count")
     ap.add_argument("--annot-fmt", dest="annot_fmt", default=".2f")
     ap.add_argument("--annot-div", dest="annot_div", type=float, default=None,
                     help="If set and --annot value, divide annotation by this (e.g., 1e-22)")
-    ap.add_argument("--tick-every", dest="tick_every", type=int, default=0)
-
-    # discrete axes & gridlines
-    ap.add_argument("--discrete-axes", action="store_true",
-                    help="Use bin centers as ticks so axes look discrete")
-    ap.add_argument("--gridlines", action="store_true",
-                    help="Draw gridlines at bin edges")
-    ap.add_argument("--gridline-alpha", type=float, default=0.35,
-                    help="Gridline transparency")
-    ap.add_argument("--gridline-width", type=float, default=0.6,
-                    help="Gridline linewidth (pt)")
     ap.add_argument("--tick-fmt", default=".0f",
-                    help="Format for tick labels when using --discrete-axes (e.g., .0f)")
+                    help="Format for tick labels (e.g., .0f)")
+    ap.add_argument("--max-ticks-x", type=int, default=10,
+                    help="Max x tick labels to draw (auto-thins if exceeded)")
+    ap.add_argument("--max-ticks-y", type=int, default=10,
+                    help="Max y tick labels to draw (auto-thins if exceeded)")
+    ap.add_argument("--gridlines", action="store_true", help="Draw gridlines at bin edges")
+    ap.add_argument("--gridline-alpha", type=float, default=0.35, help="Gridline transparency")
+    ap.add_argument("--gridline-width", type=float, default=0.6, help="Gridline linewidth (pt)")
 
     # misc
+    ap.add_argument("--per-cell", type=int, default=4)
+    ap.add_argument("--min-per-cell", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
 
     args = ap.parse_args()
@@ -266,7 +277,7 @@ def main():
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     os.makedirs(args.outdir, exist_ok=True)
 
-    # ---------- load model & diffusion ------
+    # ---------- load model & diffusion ------ #
     ckpt = torch.load(args.model, map_location=device)
     ck = ckpt.get("args", {})
     in_ch = ck.get("in_ch", 3)
@@ -297,7 +308,7 @@ def main():
     model.eval()
     diffusion = inf.CustomDiffusion(T=T, device=device)
 
-    # -- resolve inference knobs ----------
+    # -- resolve inference knobs ---------- #
     knobs = _parse_sweep_best(args.from_sweep) if args.from_sweep else {}
     def _override(k, v):
         if v is not None: knobs[k] = v
@@ -318,7 +329,7 @@ def main():
     knobs.setdefault("start_t", max(0, T-1))
     print("[knobs]", json.dumps(knobs, indent=2))
 
-    # --- read mass labels + make grid bins -------
+    # --- read mass labels + make *discrete* grid bins ------- #
     import h5py
     with h5py.File(args.input_h5, "r") as f:
         if ("label_m1" in f) and ("label_m2" in f):
@@ -333,30 +344,29 @@ def main():
 
     if args.unordered:
         M_arr = np.maximum(m1_all, m2_all); m_arr = np.minimum(m1_all, m2_all)
-        default_x_label = "m1 (max) [Msun]"; default_y_label = "m2 (min) [Msun]"
+        default_x_label = args.xlabel or "M1 (Solar Mass Units)"
+        default_y_label = args.ylabel or "M2 (Solar Mass Units)"
     else:
         M_arr = m1_all; m_arr = m2_all
-        default_x_label = "m1 [Msun]"; default_y_label = "m2 [Msun]"
+        default_x_label = args.xlabel or "M1 (Solar Mass Units)"
+        default_y_label = args.ylabel or "M2 (Solar Mass Units)"
 
-    m1_min, m1_max = float(np.min(M_arr)), float(np.max(M_arr))
-    m2_min, m2_max = float(np.min(m_arr)), float(np.max(m_arr))
+    # build edges/centers from unique values
+    edges1, x_centers = _midpoint_edges_from_values(M_arr, rdec=6)
+    edges2, y_centers = _midpoint_edges_from_values(m_arr, rdec=6)
+    G1, G2 = len(x_centers), len(y_centers)
 
-    G = int(max(2, args.grid_steps))
-    edges1 = np.linspace(m1_min, m1_max, G+1, dtype=np.float64)
-    edges2 = np.linspace(m2_min, m2_max, G+1, dtype=np.float64)
-
-    bins = [[[] for _ in range(G)] for __ in range(G)]
+    # prep bins (index lists)
+    bins = [[[] for _ in range(G2)] for __ in range(G1)]
     for idx in range(N):
-        Mv, mv = float(M_arr[idx]), float(m_arr[idx])
-        i1 = np.searchsorted(edges1, Mv, side="right") - 1
-        i2 = np.searchsorted(edges2, mv, side="right") - 1
-        i1 = int(np.clip(i1, 0, G-1)); i2 = int(np.clip(i2, 0, G-1))
-        if args.unordered and (i2 > i1): continue
+        Mv = float(M_arr[idx]); mv = float(m_arr[idx])
+        i1 = int(np.searchsorted(edges1, Mv, side="right") - 1); i1 = int(np.clip(i1, 0, G1-1))
+        i2 = int(np.searchsorted(edges2, mv, side="right") - 1); i2 = int(np.clip(i2, 0, G2-1))
         bins[i1][i2].append(idx)
 
     rng = np.random.default_rng(args.seed)
 
-    # ------- per-index inference -> metrics -----
+    # ----- per-index inference -> metrics ---- #
     per_index = []
 
     def eval_index(idx):
@@ -422,9 +432,8 @@ def main():
         )
 
     print("[grid] evaluating per-cell...")
-    for i1 in range(G):
-        for i2 in range(G):
-            if args.unordered and (i2 > i1): continue
+    for i1 in range(G1):
+        for i2 in range(G2):
             idxs = bins[i1][i2]
             if len(idxs) < args.min_per_cell: continue
             take = min(len(idxs), max(1, int(args.per_cell)))
@@ -468,9 +477,9 @@ def main():
         json.dump(agg.to_dict(orient="records"), fh, indent=2)
 
     #  heatmap arrays
-    mae_grid  = np.full((G, G), np.nan, dtype=np.float32)
-    cnt_grid  = np.zeros((G, G), dtype=np.int32)
-    corr_grid = np.full((G, G), np.nan, dtype=np.float32) if args.metrics in ("corr","mae+corr") else None
+    mae_grid  = np.full((G1, G2), np.nan, dtype=np.float32)
+    cnt_grid  = np.zeros((G1, G2), dtype=np.int32)
+    corr_grid = np.full((G1, G2), np.nan, dtype=np.float32) if args.metrics in ("corr","mae+corr") else None
 
     for _, r in agg.iterrows():
         i1, i2 = int(r["bin_i1"]), int(r["bin_i2"])
@@ -484,10 +493,12 @@ def main():
     import matplotlib.pyplot as plt
     plt.rcParams.update({"figure.dpi": 150})
 
-    x_lab = args.xlabel or default_x_label
-    y_lab = args.ylabel or default_y_label
-    x_centers = 0.5 * (edges1[:-1] + edges1[1:])
-    y_centers = 0.5 * (edges2[:-1] + edges2[1:])
+    x_lab = default_x_label
+    y_lab = default_y_label
+
+    # choose (thinned) tick locations/labels
+    xticks = _choose_tick_values(x_centers, max_labels=max(2, args.max_ticks_x))
+    yticks = _choose_tick_values(y_centers, max_labels=max(2, args.max_ticks_y))
 
     def _plot_heat(Z, title, fname, cmap="viridis", vmin=None, vmax=None):
         Zm = np.ma.masked_invalid(Z.T)
@@ -501,20 +512,12 @@ def main():
         ax.set_title(title)
         fig.colorbar(im, ax=ax, pad=0.01, shrink=0.9)
 
-        # discrete axes / tick thinning
-        if args.discrete_axes:
-            stride = max(1, args.tick_every or 1)
-            xt = x_centers[::stride]; yt = y_centers[::stride]
-            ax.set_xticks(xt); ax.set_yticks(yt)
-            ax.set_xticklabels([format(v, args.tick_fmt) for v in xt])
-            ax.set_yticklabels([format(v, args.tick_fmt) for v in yt])
-        elif args.tick_every and args.tick_every > 0:
-            ax.set_xticks(x_centers[::args.tick_every])
-            ax.set_yticks(y_centers[::args.tick_every])
-            ax.set_xticklabels([f"{v:.0f}" for v in x_centers[::args.tick_every]])
-            ax.set_yticklabels([f"{v:.0f}" for v in y_centers[::args.tick_every]])
+        # ticks at the actual mass values (possibly thinned)
+        ax.set_xticks(xticks); ax.set_yticks(yticks)
+        ax.set_xticklabels([format(v, args.tick_fmt) for v in xticks])
+        ax.set_yticklabels([format(v, args.tick_fmt) for v in yticks])
 
-        # gridlines at bin edges
+        # gridlines at bin edges (optional)
         if args.gridlines:
             for e in edges1:
                 ax.axvline(e, color="w", lw=args.gridline_width, alpha=args.gridline_alpha)
@@ -522,9 +525,8 @@ def main():
                 ax.axhline(e, color="w", lw=args.gridline_width, alpha=args.gridline_alpha)
 
         # annotations
-        for I1 in range(G):
-            for I2 in range(G):
-                if args.unordered and (I2 > I1): continue
+        for I1 in range(G1):
+            for I2 in range(G2):
                 c = cnt_grid[I1, I2]
                 if c <= 0: continue
                 if args.annot == "count":
@@ -564,8 +566,12 @@ def main():
     macro = dict(
         mae_macro_mean=_safe_mean(mae_grid),
         cells_with_data=int(np.isfinite(mae_grid).sum()),
-        total_cells=(G * (G+1) // 2) if args.unordered else (G * G),
-        per_cell=args.per_cell
+        total_cells=int(G1 * G2),
+        per_cell=args.per_cell,
+        unique_m1=len(x_centers),
+        unique_m2=len(y_centers),
+        xticks_used=[float(x) for x in xticks],
+        yticks_used=[float(y) for y in yticks],
     )
     with open(os.path.join(args.outdir, "summary.json"), "w") as fh:
         json.dump(macro, fh, indent=2)
